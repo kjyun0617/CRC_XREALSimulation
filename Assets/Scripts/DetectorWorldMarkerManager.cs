@@ -37,7 +37,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField] private bool usePreviewCenterPlacement = true;
 
     [Tooltip("Used when QR-size distance estimation is off, or when QR size cannot be read.")]
-    [SerializeField] private float defaultPlacementDistanceMeters = 1.2f;
+    [SerializeField] private float defaultPlacementDistanceMeters = 0.5f;
 
     [Tooltip("Approximate Beam Pro rear camera horizontal FOV. Tune if left/right feels wrong.")]
     [SerializeField] private float cameraHorizontalFovDegrees = 70f;
@@ -59,6 +59,19 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField] private float maxEstimatedDistanceMeters = 5.0f;
     [SerializeField] private float markerVerticalOffsetMeters = 0f;
 
+    [Header("Gaze Follow Placement")]
+    [Tooltip("ON = after QR scan, the detector follows the glasses/camera center until PlaceDetector() is called by a UI button.")]
+    [SerializeField] private bool followPreviewCenterUntilPlaced = true;
+
+    [Tooltip("If true, detector coordinates are saved only when the Place Detector button is pressed.")]
+    [SerializeField] private bool saveCoordinateOnlyWhenPlaced = true;
+
+    [Tooltip("Text shown in the marker label while it is following the view center.")]
+    [SerializeField] private string followingStateLabel = "following gaze";
+
+    [Tooltip("Text shown in the marker label after Place Detector is pressed.")]
+    [SerializeField] private string placedStateLabel = "placed";
+
     [Header("Rescan Behavior")]
     [SerializeField] private bool updateExistingMarkerOnRescan = true;
     [SerializeField] private bool smoothPositionOnRescan = true;
@@ -77,6 +90,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private readonly Dictionary<string, MarkerInfo> markers = new Dictionary<string, MarkerInfo>();
     private bool spatialEventsSubscribed = false;
+    private string currentFollowingDetectorId = "";
 
     private void OnEnable()
     {
@@ -104,6 +118,8 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private void LateUpdate()
     {
+        UpdateFollowingMarkerPosition();
+
         if (!showLabel || fallbackCamera == null)
             return;
 
@@ -134,24 +150,50 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         Quaternion worldRotation = CalculateMarkerRotation(worldPosition);
 
         MarkerInfo marker = CreateOrMoveMarker(detectorId, worldPosition, estimatedDistance, qrPixelSize, null);
-        if (marker != null)
+        if (marker == null)
+            return;
+
+        marker.lastPlacementImagePoint = placementImagePoint;
+        marker.lastImageWidth = imageWidth;
+        marker.lastImageHeight = imageHeight;
+        marker.lastPlacementMethod = placementMethod;
+
+        if (followPreviewCenterUntilPlaced)
         {
-            worldPosition = marker.savedPosition;
-            marker.anchorState = useSpatialAnchors ? "anchor saving..." : placementMethod;
+            StopPreviousFollowingMarker(detectorId);
+
+            currentFollowingDetectorId = detectorId;
+            marker.isFollowingPlacementOrigin = true;
+            marker.isPlaced = false;
+            marker.anchorState = followingStateLabel;
+
+            UpdateFollowingMarkerPosition(marker);
             UpdateLabel(marker, marker.lastRadiationValue, false);
+
+            Debug.Log($"[DetectorWorldMarkerManager] Detector is following preview center: {detectorId}, distance={marker.lastEstimatedDistance:F2}m");
+            return;
         }
 
-        SaveCoordinate(
-            detectorId,
-            worldPosition,
-            worldRotation,
-            estimatedDistance,
-            qrPixelSize,
-            placementImagePoint,
-            imageWidth,
-            imageHeight,
-            placementMethod
-        );
+        worldPosition = marker.savedPosition;
+        marker.isFollowingPlacementOrigin = false;
+        marker.isPlaced = true;
+        marker.anchorState = useSpatialAnchors ? "anchor saving..." : placementMethod;
+        UpdateLabel(marker, marker.lastRadiationValue, false);
+
+        if (!saveCoordinateOnlyWhenPlaced)
+        {
+            SaveCoordinate(
+                detectorId,
+                worldPosition,
+                worldRotation,
+                estimatedDistance,
+                qrPixelSize,
+                placementImagePoint,
+                imageWidth,
+                imageHeight,
+                placementMethod
+            );
+        }
 
         if (useSpatialAnchors && createSpatialAnchorOnQr)
         {
@@ -165,6 +207,149 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         }
 
         Debug.Log($"[DetectorWorldMarkerManager] Detector placed from preview projection: {detectorId}, method={placementMethod}, pos={worldPosition}, distance={estimatedDistance:F2}m, qrPixelSize={qrPixelSize:F1}px");
+    }
+
+    private void StopPreviousFollowingMarker(string newDetectorId)
+    {
+        if (string.IsNullOrEmpty(currentFollowingDetectorId))
+            return;
+
+        if (currentFollowingDetectorId == newDetectorId)
+            return;
+
+        if (markers.TryGetValue(currentFollowingDetectorId, out MarkerInfo previous) && previous != null)
+        {
+            previous.isFollowingPlacementOrigin = false;
+            previous.anchorState = "not placed";
+            UpdateLabel(previous, previous.lastRadiationValue, false);
+        }
+    }
+
+    private void UpdateFollowingMarkerPosition()
+    {
+        if (string.IsNullOrEmpty(currentFollowingDetectorId))
+            return;
+
+        if (!markers.TryGetValue(currentFollowingDetectorId, out MarkerInfo marker) || marker == null)
+            return;
+
+        if (!marker.isFollowingPlacementOrigin)
+            return;
+
+        UpdateFollowingMarkerPosition(marker);
+    }
+
+    private void UpdateFollowingMarkerPosition(MarkerInfo marker)
+    {
+        if (marker == null || marker.root == null)
+            return;
+
+        float distance = marker.lastEstimatedDistance > 0f
+            ? marker.lastEstimatedDistance
+            : defaultPlacementDistanceMeters;
+
+        Vector3 worldPosition = CalculateWorldPosition(new Vector2(0.5f, 0.5f), 1, 1, distance);
+        marker.root.transform.position = worldPosition;
+        marker.savedPosition = worldPosition;
+        marker.anchorState = followingStateLabel;
+    }
+
+    public void PlaceDetector()
+    {
+        if (string.IsNullOrEmpty(currentFollowingDetectorId))
+        {
+            Debug.LogWarning("[DetectorWorldMarkerManager] PlaceDetector called, but no detector is currently following the view center.");
+            return;
+        }
+
+        PlaceDetector(currentFollowingDetectorId);
+    }
+
+    public void PlaceCurrentDetector()
+    {
+        PlaceDetector();
+    }
+
+    public void ConfirmCurrentDetectorPlacement()
+    {
+        PlaceDetector();
+    }
+
+    public void StopFollowingAndPlaceDetector()
+    {
+        PlaceDetector();
+    }
+
+    public void PlaceDetector(string detectorId)
+    {
+        detectorId = NormalizeDetectorId(detectorId);
+        if (string.IsNullOrEmpty(detectorId))
+            return;
+
+        if (!markers.TryGetValue(detectorId, out MarkerInfo marker) || marker == null || marker.root == null)
+        {
+            Debug.LogWarning($"[DetectorWorldMarkerManager] PlaceDetector failed. Marker not found: {detectorId}");
+            return;
+        }
+
+        marker.isFollowingPlacementOrigin = false;
+        marker.isPlaced = true;
+        marker.savedPosition = marker.root.transform.position;
+        marker.anchorState = placedStateLabel;
+
+        if (currentFollowingDetectorId == detectorId)
+            currentFollowingDetectorId = "";
+
+        Quaternion worldRotation = CalculateMarkerRotation(marker.savedPosition);
+        string placementMethod = string.IsNullOrEmpty(marker.lastPlacementMethod)
+            ? "PreviewCenterPlacedByButton"
+            : marker.lastPlacementMethod + "+ButtonPlaced";
+
+        SaveCoordinate(
+            detectorId,
+            marker.savedPosition,
+            worldRotation,
+            marker.lastEstimatedDistance > 0f ? marker.lastEstimatedDistance : defaultPlacementDistanceMeters,
+            marker.lastQrPixelSize,
+            marker.lastPlacementImagePoint,
+            marker.lastImageWidth,
+            marker.lastImageHeight,
+            placementMethod
+        );
+
+        if (useSpatialAnchors && createSpatialAnchorOnQr)
+        {
+            EnsureSpatialAnchorManager();
+            SubscribeSpatialEvents();
+
+            if (spatialAnchorManager != null && spatialAnchorManager.IsReady())
+            {
+                marker.anchorState = "anchor saving...";
+                spatialAnchorManager.CreateAndSaveAnchorForDetector(detectorId, marker.savedPosition, worldRotation);
+            }
+            else
+            {
+                Debug.LogWarning("[DetectorWorldMarkerManager] Spatial anchor not created. Manager or ARAnchorManager missing.");
+            }
+        }
+
+        UpdateLabel(marker, marker.lastRadiationValue, false);
+        Debug.Log($"[DetectorWorldMarkerManager] Detector fixed at current preview-center position: {detectorId}, pos={marker.savedPosition}");
+    }
+
+    public void CancelCurrentFollowingDetector()
+    {
+        if (string.IsNullOrEmpty(currentFollowingDetectorId))
+            return;
+
+        if (markers.TryGetValue(currentFollowingDetectorId, out MarkerInfo marker) && marker != null)
+        {
+            marker.isFollowingPlacementOrigin = false;
+            marker.anchorState = "cancelled";
+            UpdateLabel(marker, marker.lastRadiationValue, false);
+        }
+
+        currentFollowingDetectorId = "";
     }
 
     private string NormalizeDetectorId(string rawQrText)
@@ -312,6 +497,8 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         marker.anchorGuid = persistentGuid;
         marker.anchorState = "anchor saved";
         marker.savedPosition = anchor.transform.position;
+        marker.isFollowingPlacementOrigin = false;
+        marker.isPlaced = true;
 
         if (parentMarkerToAnchor)
             marker.root.transform.SetParent(anchor.transform, true);
@@ -333,6 +520,8 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         marker.anchorGuid = persistentGuid;
         marker.anchorState = "anchor loaded";
         marker.savedPosition = anchor.transform.position;
+        marker.isFollowingPlacementOrigin = false;
+        marker.isPlaced = true;
 
         if (parentMarkerToAnchor)
             marker.root.transform.SetParent(anchor.transform, true);
@@ -446,6 +635,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             lastRadiationValue = -1f,
             lastEstimatedDistance = estimatedDistance,
             lastQrPixelSize = qrPixelSize,
+            lastPlacementImagePoint = new Vector2(0.5f, 0.5f),
+            lastImageWidth = 1,
+            lastImageHeight = 1,
+            lastPlacementMethod = "preview projection",
+            isFollowingPlacementOrigin = false,
+            isPlaced = false,
             anchorState = useSpatialAnchors ? "no anchor yet" : "preview projection"
         };
 
@@ -610,6 +805,8 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                 if (marker != null)
                 {
                     marker.anchorState = useSpatialAnchors ? "fallback coord" : record.placementMethod;
+                    marker.isFollowingPlacementOrigin = false;
+                    marker.isPlaced = true;
 
                     if (record.lastRadiationValue >= 0f)
                         UpdateMarkerVisual(marker, record.lastRadiationValue);
@@ -662,6 +859,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         public float lastRadiationValue;
         public float lastEstimatedDistance;
         public float lastQrPixelSize;
+        public Vector2 lastPlacementImagePoint;
+        public int lastImageWidth;
+        public int lastImageHeight;
+        public string lastPlacementMethod;
+        public bool isFollowingPlacementOrigin;
+        public bool isPlaced;
         public ARAnchor anchor;
         public string anchorGuid;
         public string anchorState;
