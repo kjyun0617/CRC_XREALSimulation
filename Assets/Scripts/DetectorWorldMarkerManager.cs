@@ -37,7 +37,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField] private bool usePreviewCenterPlacement = true;
 
     [Tooltip("Used when QR-size distance estimation is off, or when QR size cannot be read.")]
-    [SerializeField] private float defaultPlacementDistanceMeters = 0.5f;
+    [SerializeField] private float defaultPlacementDistanceMeters = 1.0f;
 
     [Tooltip("Approximate Beam Pro rear camera horizontal FOV. Tune if left/right feels wrong.")]
     [SerializeField] private float cameraHorizontalFovDegrees = 70f;
@@ -107,7 +107,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private void Start()
     {
-        EnsurePlacementOrigin();
+        EnsurePlacementOrigin();                // pivot locate
         EnsureCoordinateDatabase();
         EnsureSpatialAnchorManager();
         SubscribeSpatialEvents();
@@ -167,8 +167,10 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             marker.isPlaced = false;
             marker.anchorState = followingStateLabel;
 
+            marker.lastEstimatedDistance = defaultPlacementDistanceMeters;
+
             UpdateFollowingMarkerPosition(marker);
-            UpdateLabel(marker, marker.lastRadiationValue, false);
+            UpdateMarkerVisual(marker, marker.lastRadiationValue);
 
             Debug.Log($"[DetectorWorldMarkerManager] Detector is following preview center: {detectorId}, distance={marker.lastEstimatedDistance:F2}m");
             return;
@@ -244,14 +246,23 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (marker == null || marker.root == null)
             return;
 
-        float distance = marker.lastEstimatedDistance > 0f
+        float distance = useQrSizeToEstimateDistance && marker.lastEstimatedDistance > 0f
             ? marker.lastEstimatedDistance
             : defaultPlacementDistanceMeters;
 
         Vector3 worldPosition = CalculateWorldPosition(new Vector2(0.5f, 0.5f), 1, 1, distance);
+
+        marker.root.SetActive(true);
         marker.root.transform.position = worldPosition;
         marker.savedPosition = worldPosition;
+        marker.lastEstimatedDistance = distance;
         marker.anchorState = followingStateLabel;
+
+        if (marker.renderer != null)
+            marker.renderer.enabled = true;
+
+        if (showLabel && marker.label != null)
+            marker.label.gameObject.SetActive(true);
     }
 
     public void PlaceDetector()
