@@ -36,3 +36,4 @@ n# Android build outputs
 *.apk
 *.aab
 apkfiles/
+UnityDebugUpload/
