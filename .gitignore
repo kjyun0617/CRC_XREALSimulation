@@ -17,6 +17,9 @@
 *.userprefs
 *.pidb
 *.booproj
+*.apk
+*.aab
+apkfiles/
 
 # OS files
 .DS_Store
@@ -27,3 +30,9 @@ Thumbs.db
 
 # Gradle / Android
 .gradle/
+
+n# Android build outputs
+# Android build outputs
+*.apk
+*.aab
+apkfiles/
