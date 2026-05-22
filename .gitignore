@@ -37,3 +37,6 @@ n# Android build outputs
 *.aab
 apkfiles/
 UnityDebugUpload/
+
+# Unity temporary build/debug files
+.utmp/
