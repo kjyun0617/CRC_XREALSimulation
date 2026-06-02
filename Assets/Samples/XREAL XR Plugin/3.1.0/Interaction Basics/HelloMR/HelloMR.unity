@@ -907,18 +907,23 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 0375000066dcbf3499b56faf84e0cff5, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  placementOrigin: {fileID: 0}
-  fallbackCamera: {fileID: 0}
+  placementOrigin: {fileID: 876944438}
+  fallbackCamera: {fileID: 609993946}
   markerPrefab: {fileID: 0}
   useCoordinateDatabase: 1
   coordinateDatabase: {fileID: 906282734}
-  loadSavedCoordinatesOnStart: 1
+  loadSavedCoordinatesOnStart: 0
   useSpatialAnchors: 0
   spatialAnchorManager: {fileID: 0}
   createSpatialAnchorOnQr: 0
   parentMarkerToAnchor: 1
   usePreviewCenterPlacement: 1
-  defaultPlacementDistanceMeters: 0
+  defaultPlacementDistanceMeters: 2
+  followPreviewCenterUntilPlaced: 1
+  saveCoordinateOnlyWhenPlaced: 1
+  followingStateLabel: following gaze
+  placedStateLabel: placed
+  markerVerticalOffsetMeters: 0
   cameraHorizontalFovDegrees: 70
   cameraVerticalFovDegrees: 50
   useQrSizeToEstimateDistance: 0
@@ -927,16 +932,11 @@ MonoBehaviour:
   distanceCalibrationMultiplier: 1
   minEstimatedDistanceMeters: 0.3
   maxEstimatedDistanceMeters: 5
-  markerVerticalOffsetMeters: 0
-  followPreviewCenterUntilPlaced: 1
-  saveCoordinateOnlyWhenPlaced: 1
-  followingStateLabel: following gaze
-  placedStateLabel: placed
   updateExistingMarkerOnRescan: 1
-  smoothPositionOnRescan: 1
+  smoothPositionOnRescan: 0
   rescanPositionBlend: 0.55
-  baseMarkerSize: 0.16
-  maxSizeMultiplier: 3
+  fixedMarkerSize: 0.2
+  markerAlpha: 0.55
   showLabel: 1
   showDistanceInLabel: 1
   showAnchorStateInLabel: 1
@@ -1370,6 +1370,11 @@ MonoBehaviour:
   rememberScannedQrTexts: 1
   hidePreviewBeforeNotify: 1
   detectorNameList: []
+--- !u!4 &876944438 stripped
+Transform:
+  m_CorrespondingSourceObject: {fileID: 9011500862288746604, guid: 3182b5074a6bf3d4887a44a38cbb9cb6, type: 3}
+  m_PrefabInstance: {fileID: 694392833}
+  m_PrefabAsset: {fileID: 0}
 --- !u!1 &906282733
 GameObject:
   m_ObjectHideFlags: 0

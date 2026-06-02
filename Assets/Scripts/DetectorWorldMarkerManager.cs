@@ -4,10 +4,10 @@ using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 
 /// <summary>
-/// Previous preview-center detector placement flow.
-/// QR scan selects detectorId, then marker is placed from camera preview center direction
-/// at default/estimated distance. It saves JSON fallback coordinates and optionally
-/// creates persistent spatial anchors.
+/// Preview-center detector placement flow.
+/// QR scan selects detectorId, then marker preview follows the glasses/camera center
+/// until PlaceDetector() is called. The placed marker keeps the same fixed size and
+/// updates color by radiation value with a transparent material.
 /// </summary>
 public class DetectorWorldMarkerManager : MonoBehaviour
 {
@@ -24,7 +24,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [Header("Coordinate Storage")]
     [SerializeField] private bool useCoordinateDatabase = true;
     [SerializeField] private DetectorCoordinateDatabase coordinateDatabase;
-    [SerializeField] private bool loadSavedCoordinatesOnStart = true;
+    [SerializeField] private bool loadSavedCoordinatesOnStart = false;
 
     [Header("Spatial Anchor Storage")]
     [SerializeField] private bool useSpatialAnchors = false;
@@ -33,19 +33,34 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField] private bool parentMarkerToAnchor = true;
 
     [Header("Preview-Center Placement")]
-    [Tooltip("ON = place using camera preview center. OFF = place using ZXing QR image center.")]
+    [Tooltip("ON = use camera/glasses center. OFF = use ZXing QR image center.")]
     [SerializeField] private bool usePreviewCenterPlacement = true;
 
-    [Tooltip("Used when QR-size distance estimation is off, or when QR size cannot be read.")]
-    [SerializeField] private float defaultPlacementDistanceMeters = 1.0f;
+    [Tooltip("Distance from glasses/camera to detector preview and final placed detector. Try 1.5 ~ 2.5m if too close.")]
+    [SerializeField] private float defaultPlacementDistanceMeters = 2.0f;
 
-    [Tooltip("Approximate Beam Pro rear camera horizontal FOV. Tune if left/right feels wrong.")]
+    [Tooltip("ON = after QR scan, the marker preview follows the glasses/camera center until PlaceDetector() is called.")]
+    [SerializeField] private bool followPreviewCenterUntilPlaced = true;
+
+    [Tooltip("ON = save detector coordinate only when PlaceDetector() is called.")]
+    [SerializeField] private bool saveCoordinateOnlyWhenPlaced = true;
+
+    [Tooltip("Label text shown while the detector preview is following the glasses/camera center.")]
+    [SerializeField] private string followingStateLabel = "following gaze";
+
+    [Tooltip("Label text shown after PlaceDetector() fixes the detector in world space.")]
+    [SerializeField] private string placedStateLabel = "placed";
+
+    [Tooltip("Optional vertical offset while previewing/placing. Usually 0.")]
+    [SerializeField] private float markerVerticalOffsetMeters = 0f;
+
+    [Tooltip("Approximate Beam Pro rear camera horizontal FOV. Used only when not using pure center placement.")]
     [SerializeField] private float cameraHorizontalFovDegrees = 70f;
 
-    [Tooltip("Approximate Beam Pro rear camera vertical FOV. Tune if up/down feels wrong.")]
+    [Tooltip("Approximate Beam Pro rear camera vertical FOV. Used only when not using pure center placement.")]
     [SerializeField] private float cameraVerticalFovDegrees = 50f;
 
-    [Tooltip("If on, distance is estimated from visible QR size.")]
+    [Tooltip("OFF recommended for current preview-center flow. If ON, QR size can override default distance.")]
     [SerializeField] private bool useQrSizeToEstimateDistance = false;
 
     [Tooltip("Physical side length of printed QR code in meters. Example: 8cm = 0.08")]
@@ -57,29 +72,19 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField, Range(0.3f, 3.0f)] private float distanceCalibrationMultiplier = 1.0f;
     [SerializeField] private float minEstimatedDistanceMeters = 0.3f;
     [SerializeField] private float maxEstimatedDistanceMeters = 5.0f;
-    [SerializeField] private float markerVerticalOffsetMeters = 0f;
-
-    [Header("Gaze Follow Placement")]
-    [Tooltip("ON = after QR scan, the detector follows the glasses/camera center until PlaceDetector() is called by a UI button.")]
-    [SerializeField] private bool followPreviewCenterUntilPlaced = true;
-
-    [Tooltip("If true, detector coordinates are saved only when the Place Detector button is pressed.")]
-    [SerializeField] private bool saveCoordinateOnlyWhenPlaced = true;
-
-    [Tooltip("Text shown in the marker label while it is following the view center.")]
-    [SerializeField] private string followingStateLabel = "following gaze";
-
-    [Tooltip("Text shown in the marker label after Place Detector is pressed.")]
-    [SerializeField] private string placedStateLabel = "placed";
 
     [Header("Rescan Behavior")]
     [SerializeField] private bool updateExistingMarkerOnRescan = true;
-    [SerializeField] private bool smoothPositionOnRescan = true;
+    [SerializeField] private bool smoothPositionOnRescan = false;
     [SerializeField, Range(0.05f, 1.0f)] private float rescanPositionBlend = 0.55f;
 
     [Header("Marker Visual")]
-    [SerializeField] private float baseMarkerSize = 0.16f;
-    [SerializeField] private float maxSizeMultiplier = 3.0f;
+    [Tooltip("Fixed world scale of every detector sphere. Radiation value changes color only, not size.")]
+    [SerializeField] private float fixedMarkerSize = 0.20f;
+
+    [Tooltip("Alpha value for transparent detector sphere. 0 = invisible, 1 = opaque.")]
+    [SerializeField, Range(0.05f, 1.0f)] private float markerAlpha = 0.55f;
+
     [SerializeField] private bool showLabel = true;
     [SerializeField] private bool showDistanceInLabel = true;
     [SerializeField] private bool showAnchorStateInLabel = true;
@@ -107,7 +112,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private void Start()
     {
-        EnsurePlacementOrigin();                // pivot locate
+        EnsurePlacementOrigin();
         EnsureCoordinateDatabase();
         EnsureSpatialAnchorManager();
         SubscribeSpatialEvents();
@@ -118,6 +123,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private void LateUpdate()
     {
+        EnsurePlacementOrigin();
         UpdateFollowingMarkerPosition();
 
         if (!showLabel || fallbackCamera == null)
@@ -157,6 +163,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         marker.lastImageWidth = imageWidth;
         marker.lastImageHeight = imageHeight;
         marker.lastPlacementMethod = placementMethod;
+        marker.lastEstimatedDistance = estimatedDistance;
 
         if (followPreviewCenterUntilPlaced)
         {
@@ -166,49 +173,37 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             marker.isFollowingPlacementOrigin = true;
             marker.isPlaced = false;
             marker.anchorState = followingStateLabel;
-
             marker.lastEstimatedDistance = defaultPlacementDistanceMeters;
+
+            if (marker.root != null)
+            {
+                marker.root.SetActive(true);
+
+                if (marker.renderer != null)
+                    marker.renderer.enabled = true;
+            }
 
             UpdateFollowingMarkerPosition(marker);
             UpdateMarkerVisual(marker, marker.lastRadiationValue);
 
-            Debug.Log($"[DetectorWorldMarkerManager] Detector is following preview center: {detectorId}, distance={marker.lastEstimatedDistance:F2}m");
+            Debug.Log($"[DetectorWorldMarkerManager] Detector preview following gaze: {detectorId}, distance={defaultPlacementDistanceMeters:F2}m");
             return;
         }
 
-        worldPosition = marker.savedPosition;
         marker.isFollowingPlacementOrigin = false;
         marker.isPlaced = true;
         marker.anchorState = useSpatialAnchors ? "anchor saving..." : placementMethod;
-        UpdateLabel(marker, marker.lastRadiationValue, false);
+        UpdateMarkerVisual(marker, marker.lastRadiationValue);
 
         if (!saveCoordinateOnlyWhenPlaced)
         {
-            SaveCoordinate(
-                detectorId,
-                worldPosition,
-                worldRotation,
-                estimatedDistance,
-                qrPixelSize,
-                placementImagePoint,
-                imageWidth,
-                imageHeight,
-                placementMethod
-            );
+            SaveCoordinate(detectorId, worldPosition, worldRotation, estimatedDistance, qrPixelSize, placementImagePoint, imageWidth, imageHeight, placementMethod);
         }
 
         if (useSpatialAnchors && createSpatialAnchorOnQr)
-        {
-            EnsureSpatialAnchorManager();
-            SubscribeSpatialEvents();
+            CreateAnchorForMarker(detectorId, worldPosition, worldRotation);
 
-            if (spatialAnchorManager != null && spatialAnchorManager.IsReady())
-                spatialAnchorManager.CreateAndSaveAnchorForDetector(detectorId, worldPosition, worldRotation);
-            else
-                Debug.LogWarning("[DetectorWorldMarkerManager] Spatial anchor not created. Manager or ARAnchorManager missing.");
-        }
-
-        Debug.Log($"[DetectorWorldMarkerManager] Detector placed from preview projection: {detectorId}, method={placementMethod}, pos={worldPosition}, distance={estimatedDistance:F2}m, qrPixelSize={qrPixelSize:F1}px");
+        Debug.Log($"[DetectorWorldMarkerManager] Detector placed from projection: {detectorId}, method={placementMethod}, pos={worldPosition}, distance={estimatedDistance:F2}m, qrPixelSize={qrPixelSize:F1}px");
     }
 
     private void StopPreviousFollowingMarker(string newDetectorId)
@@ -235,7 +230,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (!markers.TryGetValue(currentFollowingDetectorId, out MarkerInfo marker) || marker == null)
             return;
 
-        if (!marker.isFollowingPlacementOrigin)
+        if (!marker.isFollowingPlacementOrigin || marker.isPlaced)
             return;
 
         UpdateFollowingMarkerPosition(marker);
@@ -246,30 +241,40 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (marker == null || marker.root == null)
             return;
 
-        float distance = useQrSizeToEstimateDistance && marker.lastEstimatedDistance > 0f
-            ? marker.lastEstimatedDistance
-            : defaultPlacementDistanceMeters;
+        EnsurePlacementOrigin();
+        if (placementOrigin == null)
+        {
+            Debug.LogWarning("[DetectorWorldMarkerManager] Cannot update detector preview. Placement Origin is missing.");
+            return;
+        }
 
-        Vector3 worldPosition = CalculateWorldPosition(new Vector2(0.5f, 0.5f), 1, 1, distance);
+        float distance = defaultPlacementDistanceMeters;
+
+        Vector3 direction = placementOrigin.forward.sqrMagnitude > 0.0001f
+            ? placementOrigin.forward.normalized
+            : Vector3.forward;
+
+        Vector3 worldPosition = placementOrigin.position + direction * distance;
+        worldPosition += placementOrigin.up * markerVerticalOffsetMeters;
 
         marker.root.SetActive(true);
         marker.root.transform.position = worldPosition;
-        marker.savedPosition = worldPosition;
-        marker.lastEstimatedDistance = distance;
-        marker.anchorState = followingStateLabel;
+        marker.root.transform.rotation = Quaternion.LookRotation(direction, placementOrigin.up);
+        marker.root.transform.localScale = Vector3.one * fixedMarkerSize;
 
         if (marker.renderer != null)
             marker.renderer.enabled = true;
 
-        if (showLabel && marker.label != null)
-            marker.label.gameObject.SetActive(true);
+        marker.savedPosition = worldPosition;
+        marker.lastEstimatedDistance = distance;
+        marker.anchorState = followingStateLabel;
     }
 
     public void PlaceDetector()
     {
         if (string.IsNullOrEmpty(currentFollowingDetectorId))
         {
-            Debug.LogWarning("[DetectorWorldMarkerManager] PlaceDetector called, but no detector is currently following the view center.");
+            Debug.LogWarning("[DetectorWorldMarkerManager] PlaceDetector called, but no detector preview is following the view center.");
             return;
         }
 
@@ -303,6 +308,9 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             return;
         }
 
+        if (marker.isFollowingPlacementOrigin && !marker.isPlaced)
+            UpdateFollowingMarkerPosition(marker);
+
         marker.isFollowingPlacementOrigin = false;
         marker.isPlaced = true;
         marker.savedPosition = marker.root.transform.position;
@@ -313,14 +321,14 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         Quaternion worldRotation = CalculateMarkerRotation(marker.savedPosition);
         string placementMethod = string.IsNullOrEmpty(marker.lastPlacementMethod)
-            ? "PreviewCenterPlacedByButton"
+            ? "PreviewCenterButtonPlaced"
             : marker.lastPlacementMethod + "+ButtonPlaced";
 
         SaveCoordinate(
             detectorId,
             marker.savedPosition,
             worldRotation,
-            marker.lastEstimatedDistance > 0f ? marker.lastEstimatedDistance : defaultPlacementDistanceMeters,
+            defaultPlacementDistanceMeters,
             marker.lastQrPixelSize,
             marker.lastPlacementImagePoint,
             marker.lastImageWidth,
@@ -329,23 +337,11 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         );
 
         if (useSpatialAnchors && createSpatialAnchorOnQr)
-        {
-            EnsureSpatialAnchorManager();
-            SubscribeSpatialEvents();
+            CreateAnchorForMarker(detectorId, marker.savedPosition, worldRotation);
 
-            if (spatialAnchorManager != null && spatialAnchorManager.IsReady())
-            {
-                marker.anchorState = "anchor saving...";
-                spatialAnchorManager.CreateAndSaveAnchorForDetector(detectorId, marker.savedPosition, worldRotation);
-            }
-            else
-            {
-                Debug.LogWarning("[DetectorWorldMarkerManager] Spatial anchor not created. Manager or ARAnchorManager missing.");
-            }
-        }
-
-        UpdateLabel(marker, marker.lastRadiationValue, false);
-        Debug.Log($"[DetectorWorldMarkerManager] Detector fixed at current preview-center position: {detectorId}, pos={marker.savedPosition}");
+        ForceMarkerVisible(marker);
+        UpdateMarkerVisual(marker, marker.lastRadiationValue);
+        Debug.Log($"[DetectorWorldMarkerManager] Detector fixed: {detectorId}, pos={marker.savedPosition}, distance={defaultPlacementDistanceMeters:F2}m");
     }
 
     public void CancelCurrentFollowingDetector()
@@ -375,6 +371,13 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (placementOrigin == null)
             return transform.position;
 
+        if (usePreviewCenterPlacement)
+        {
+            Vector3 direct = placementOrigin.position + placementOrigin.forward.normalized * distance;
+            direct += placementOrigin.up * markerVerticalOffsetMeters;
+            return direct;
+        }
+
         float viewportX = imageWidth > 0 ? Mathf.Clamp01(imagePoint.x / imageWidth) : 0.5f;
         float viewportY = imageHeight > 0 ? Mathf.Clamp01(1f - (imagePoint.y / imageHeight)) : 0.5f;
 
@@ -392,7 +395,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         direction.Normalize();
 
         Vector3 worldPosition = placementOrigin.position + direction * distance;
-        worldPosition += Vector3.up * markerVerticalOffsetMeters;
+        worldPosition += placementOrigin.up * markerVerticalOffsetMeters;
         return worldPosition;
     }
 
@@ -448,7 +451,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         {
             GameObject dbObject = new GameObject("DetectorCoordinateDatabase");
             coordinateDatabase = dbObject.AddComponent<DetectorCoordinateDatabase>();
-            Debug.Log("[DetectorWorldMarkerManager] DetectorCoordinateDatabase was created automatically.");
+            Debug.Log("[DetectorWorldMarkerManager] Created DetectorCoordinateDatabase automatically.");
         }
     }
 
@@ -461,13 +464,6 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             return;
 
         spatialAnchorManager = FindObjectOfType<DetectorSpatialAnchorManager>();
-
-        if (spatialAnchorManager == null)
-        {
-            GameObject anchorObject = new GameObject("DetectorSpatialAnchorManager");
-            spatialAnchorManager = anchorObject.AddComponent<DetectorSpatialAnchorManager>();
-            Debug.Log("[DetectorWorldMarkerManager] DetectorSpatialAnchorManager was created automatically.");
-        }
     }
 
     private void SubscribeSpatialEvents()
@@ -475,7 +471,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (!useSpatialAnchors || spatialAnchorManager == null || spatialEventsSubscribed)
             return;
 
-        spatialAnchorManager.AnchorSaved += HandleAnchorSaved;
+        spatialAnchorManager.AnchorSaved += HandleAnchorCreatedAndSaved;
         spatialAnchorManager.AnchorLoaded += HandleAnchorLoaded;
         spatialAnchorManager.AnchorSaveFailed += HandleAnchorSaveFailed;
         spatialAnchorManager.AnchorLoadFailed += HandleAnchorLoadFailed;
@@ -487,21 +483,28 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (spatialAnchorManager == null || !spatialEventsSubscribed)
             return;
 
-        spatialAnchorManager.AnchorSaved -= HandleAnchorSaved;
+        spatialAnchorManager.AnchorSaved -= HandleAnchorCreatedAndSaved;
         spatialAnchorManager.AnchorLoaded -= HandleAnchorLoaded;
         spatialAnchorManager.AnchorSaveFailed -= HandleAnchorSaveFailed;
         spatialAnchorManager.AnchorLoadFailed -= HandleAnchorLoadFailed;
         spatialEventsSubscribed = false;
     }
 
-    private void HandleAnchorSaved(string detectorId, ARAnchor anchor, string persistentGuid)
+    private void CreateAnchorForMarker(string detectorId, Vector3 worldPosition, Quaternion worldRotation)
+    {
+        EnsureSpatialAnchorManager();
+        SubscribeSpatialEvents();
+
+        if (spatialAnchorManager != null && spatialAnchorManager.IsReady())
+            spatialAnchorManager.CreateAndSaveAnchorForDetector(detectorId, worldPosition, worldRotation);
+        else
+            Debug.LogWarning("[DetectorWorldMarkerManager] Spatial anchor not created. Manager or ARAnchorManager missing.");
+    }
+
+    private void HandleAnchorCreatedAndSaved(string detectorId, ARAnchor anchor, string persistentGuid)
     {
         detectorId = NormalizeDetectorId(detectorId);
-        if (string.IsNullOrEmpty(detectorId) || anchor == null)
-            return;
-
-        MarkerInfo marker = CreateOrMoveMarker(detectorId, anchor.transform.position, 0f, 0f, anchor.transform);
-        if (marker == null)
+        if (!markers.TryGetValue(detectorId, out MarkerInfo marker) || marker == null)
             return;
 
         marker.anchor = anchor;
@@ -511,16 +514,17 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         marker.isFollowingPlacementOrigin = false;
         marker.isPlaced = true;
 
-        if (parentMarkerToAnchor)
+        if (parentMarkerToAnchor && anchor != null && marker.root != null)
             marker.root.transform.SetParent(anchor.transform, true);
 
-        UpdateLabel(marker, marker.lastRadiationValue, false);
+        UpdateMarkerVisual(marker, marker.lastRadiationValue);
+        Debug.Log($"[DetectorWorldMarkerManager] Anchor created and saved: {detectorId}, {persistentGuid}");
     }
 
     private void HandleAnchorLoaded(string detectorId, ARAnchor anchor, string persistentGuid)
     {
         detectorId = NormalizeDetectorId(detectorId);
-        if (string.IsNullOrEmpty(detectorId) || anchor == null)
+        if (anchor == null)
             return;
 
         MarkerInfo marker = CreateOrMoveMarker(detectorId, anchor.transform.position, 0f, 0f, anchor.transform);
@@ -534,13 +538,13 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         marker.isFollowingPlacementOrigin = false;
         marker.isPlaced = true;
 
-        if (parentMarkerToAnchor)
+        if (parentMarkerToAnchor && marker.root != null)
             marker.root.transform.SetParent(anchor.transform, true);
 
         if (coordinateDatabase != null && coordinateDatabase.TryGetRecord(detectorId, out DetectorCoordinateRecord record) && record.lastRadiationValue >= 0f)
             UpdateMarkerVisual(marker, record.lastRadiationValue);
         else
-            UpdateLabel(marker, marker.lastRadiationValue, false);
+            UpdateMarkerVisual(marker, marker.lastRadiationValue);
     }
 
     private void HandleAnchorSaveFailed(string detectorId, string message)
@@ -568,7 +572,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                 if (record.lastRadiationValue >= 0f)
                     UpdateMarkerVisual(marker, record.lastRadiationValue);
                 else
-                    UpdateLabel(marker, marker.lastRadiationValue, false);
+                    UpdateMarkerVisual(marker, marker.lastRadiationValue);
             }
         }
 
@@ -604,11 +608,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                 return existing;
 
             Vector3 finalPosition = worldPosition;
-            if (smoothPositionOnRescan && existing.anchor == null)
+            if (smoothPositionOnRescan && existing.anchor == null && !existing.isFollowingPlacementOrigin)
                 finalPosition = Vector3.Lerp(existing.savedPosition, worldPosition, rescanPositionBlend);
 
             existing.root.transform.SetParent(parent != null && parentMarkerToAnchor ? parent : transform, true);
             existing.root.transform.position = finalPosition;
+            existing.root.transform.localScale = Vector3.one * fixedMarkerSize;
             existing.savedPosition = finalPosition;
 
             if (estimatedDistance > 0f)
@@ -616,7 +621,8 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             if (qrPixelSize > 0f)
                 existing.lastQrPixelSize = qrPixelSize;
 
-            UpdateLabel(existing, existing.lastRadiationValue, true);
+            ForceMarkerVisible(existing);
+            UpdateMarkerVisual(existing, existing.lastRadiationValue);
             return existing;
         }
 
@@ -628,7 +634,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         root.name = $"DetectorMarker_{detectorId}";
         root.transform.position = worldPosition;
-        root.transform.localScale = Vector3.one * baseMarkerSize;
+        root.transform.localScale = Vector3.one * fixedMarkerSize;
 
         Renderer renderer = root.GetComponentInChildren<Renderer>();
         TMP_Text label = null;
@@ -656,6 +662,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         };
 
         markers.Add(detectorId, info);
+        ForceMarkerVisible(info);
         UpdateMarkerVisual(info, -1f);
         return info;
     }
@@ -703,48 +710,97 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private void UpdateMarkerVisual(MarkerInfo marker, float radiationValue)
     {
+        if (marker == null || marker.root == null)
+            return;
+
         marker.lastRadiationValue = radiationValue;
 
         Color color = GetRiskColor(radiationValue);
-        SetRendererColor(marker.renderer, color);
+        color.a = markerAlpha;
+        SetRendererTransparentColor(marker.renderer, color);
 
-        float sizeMultiplier = 1f;
-        if (radiationValue > 0f && warningMax > 0f)
-            sizeMultiplier = Mathf.Lerp(1f, maxSizeMultiplier, Mathf.Clamp01(radiationValue / (warningMax * 2f)));
-
-        marker.root.transform.localScale = Vector3.one * baseMarkerSize * sizeMultiplier;
+        // Radiation value affects color only. Size always stays fixed.
+        marker.root.transform.localScale = Vector3.one * fixedMarkerSize;
+        ForceMarkerVisible(marker);
         UpdateLabel(marker, radiationValue, false);
     }
 
     private Color GetRiskColor(float radiationValue)
     {
         if (radiationValue < 0f)
-            return Color.gray;
+            return new Color(0.65f, 0.65f, 0.65f, markerAlpha);
 
         if (radiationValue <= safeMax)
-            return Color.green;
+            return new Color(0.0f, 1.0f, 0.25f, markerAlpha);
 
         if (radiationValue <= warningMax)
-            return Color.yellow;
+            return new Color(1.0f, 0.85f, 0.0f, markerAlpha);
 
-        return Color.red;
+        return new Color(1.0f, 0.0f, 0.0f, markerAlpha);
     }
 
-    private void SetRendererColor(Renderer renderer, Color color)
+    private void ForceMarkerVisible(MarkerInfo marker)
+    {
+        if (marker == null)
+            return;
+
+        if (marker.root != null)
+            marker.root.SetActive(true);
+
+        if (marker.renderer != null)
+            marker.renderer.enabled = true;
+
+        if (showLabel && marker.label != null)
+            marker.label.gameObject.SetActive(true);
+    }
+
+    private void SetRendererTransparentColor(Renderer renderer, Color color)
     {
         if (renderer == null || renderer.material == null)
             return;
 
-        if (renderer.material.HasProperty("_BaseColor"))
-            renderer.material.SetColor("_BaseColor", color);
+        Material material = renderer.material;
+        ConfigureTransparentMaterial(material);
 
-        if (renderer.material.HasProperty("_Color"))
-            renderer.material.SetColor("_Color", color);
+        if (material.HasProperty("_BaseColor"))
+            material.SetColor("_BaseColor", color);
+
+        if (material.HasProperty("_Color"))
+            material.SetColor("_Color", color);
+    }
+
+    private void ConfigureTransparentMaterial(Material material)
+    {
+        if (material == null)
+            return;
+
+        // URP/Lit transparent setup.
+        if (material.HasProperty("_Surface"))
+            material.SetFloat("_Surface", 1f);
+        if (material.HasProperty("_Blend"))
+            material.SetFloat("_Blend", 0f);
+        if (material.HasProperty("_AlphaClip"))
+            material.SetFloat("_AlphaClip", 0f);
+        if (material.HasProperty("_SrcBlend"))
+            material.SetFloat("_SrcBlend", (float)UnityEngine.Rendering.BlendMode.SrcAlpha);
+        if (material.HasProperty("_DstBlend"))
+            material.SetFloat("_DstBlend", (float)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+        if (material.HasProperty("_ZWrite"))
+            material.SetFloat("_ZWrite", 0f);
+
+        material.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+        material.EnableKeyword("_ALPHABLEND_ON");
+        material.DisableKeyword("_ALPHATEST_ON");
+        material.renderQueue = (int)UnityEngine.Rendering.RenderQueue.Transparent;
+
+        // Built-in Standard shader transparent setup.
+        if (material.HasProperty("_Mode"))
+            material.SetFloat("_Mode", 3f);
     }
 
     private void UpdateLabel(MarkerInfo marker, float radiationValue, bool moved)
     {
-        if (marker.label == null)
+        if (marker == null || marker.label == null)
             return;
 
         string text = marker.detectorId;
@@ -805,13 +861,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                 if (useSpatialAnchors && record.HasSavedAnchor())
                     continue;
 
-                MarkerInfo marker = CreateOrMoveMarker(
-                    record.detectorId,
-                    record.GetPosition(),
-                    record.estimatedDistanceMeters,
-                    record.qrPixelSize,
-                    null
-                );
+                MarkerInfo marker = CreateOrMoveMarker(record.detectorId, record.GetPosition(), record.estimatedDistanceMeters, record.qrPixelSize, null);
 
                 if (marker != null)
                 {
@@ -822,7 +872,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                     if (record.lastRadiationValue >= 0f)
                         UpdateMarkerVisual(marker, record.lastRadiationValue);
                     else
-                        UpdateLabel(marker, marker.lastRadiationValue, false);
+                        UpdateMarkerVisual(marker, marker.lastRadiationValue);
                 }
             }
 
@@ -847,6 +897,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         }
 
         markers.Clear();
+        currentFollowingDetectorId = "";
 
         if (coordinateDatabase != null)
             coordinateDatabase.ClearAllCoordinates();
