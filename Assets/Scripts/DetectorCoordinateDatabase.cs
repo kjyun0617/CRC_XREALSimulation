@@ -153,6 +153,30 @@ public class DetectorCoordinateDatabase : MonoBehaviour
             SaveToDisk();
     }
 
+    public bool RemoveCoordinate(string detectorId)
+    {
+        detectorId = NormalizeId(detectorId);
+        if (string.IsNullOrEmpty(detectorId))
+            return false;
+
+        bool removed = recordsById.Remove(detectorId);
+
+        for (int i = saveRoot.records.Count - 1; i >= 0; i--)
+        {
+            DetectorCoordinateRecord record = saveRoot.records[i];
+            if (record != null && NormalizeId(record.detectorId) == detectorId)
+            {
+                saveRoot.records.RemoveAt(i);
+                removed = true;
+            }
+        }
+
+        if (removed && autoSaveAfterEachChange)
+            SaveToDisk();
+
+        return removed;
+    }
+
     public void SaveToDisk()
     {
         try

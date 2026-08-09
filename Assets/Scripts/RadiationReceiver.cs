@@ -1,15 +1,27 @@
 using System.Collections;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using NativeWebSocket;
 using Newtonsoft.Json.Linq;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
+using ZXing;
+
 
 public class RadiationReceiver : MonoBehaviour
 {
+    public delegate void DisplayTextChangedSignature(string message);
+    public static event DisplayTextChangedSignature OnDisplayTextChanged;
+
+    private string currentDisplayMessage = "";
+
+    public string CurrentDisplayMessage => currentDisplayMessage;
     public delegate void RadiationDataReceivedSignature(Dictionary<string, float> deviceData);
     public static event RadiationDataReceivedSignature OnRadiationDataReceived;
+
+    public delegate void ServerStatusChangedSignature(string message, Color color);
+    public static event ServerStatusChangedSignature OnServerStatusChanged;
 
     [Header("UI")]
     [SerializeField] private TMP_Text displayText;
@@ -34,6 +46,11 @@ public class RadiationReceiver : MonoBehaviour
     private WebSocket websocket;
     private string savedIp;
     private bool isConnecting;
+    private string currentStatusMessage = "";
+    private Color currentStatusColor = Color.white;
+
+    public string CurrentStatusMessage => currentStatusMessage;
+    public Color CurrentStatusColor => currentStatusColor;
 
 #if UNITY_ANDROID && !UNITY_EDITOR
     private TouchScreenKeyboard activeKeyboard;
@@ -53,7 +70,7 @@ public class RadiationReceiver : MonoBehaviour
             connectButton.onClick.AddListener(OnConnectButtonClicked);
 
         if (qrScanner == null)
-            qrScanner = FindObjectOfType<QRScanner>();
+            qrScanner = FindFirstObjectByType<QRScanner>();
 
         UpdateStatus("Disconnected", Color.red);
 
@@ -110,8 +127,29 @@ public class RadiationReceiver : MonoBehaviour
 
     private void OnConnectButtonClicked()
     {
-        if (ipInputField == null) return;
+        ConnectUsingInputField();
+    }
+
+    public void ConnectUsingInputField()
+    {
+        if (ipInputField == null)
+        {
+            UpdateStatus("IP input field missing", Color.red);
+            return;
+        }
+
         SaveAndConnect(ipInputField.text);
+    }
+
+    public void ConnectToServerWithIp(string ip)
+    {
+        SaveAndConnect(ip);
+    }
+
+    public void SetIpText(string ip)
+    {
+        if (ipInputField != null)
+            ipInputField.text = ip;
     }
 
     private void SaveAndConnect(string ip)
@@ -210,9 +248,12 @@ public class RadiationReceiver : MonoBehaviour
 
                 UnityMainThreadDispatcher.Enqueue(() =>
                 {
+                    currentDisplayMessage = result;
+
                     if (displayText != null)
                         displayText.text = result;
 
+                    OnDisplayTextChanged?.Invoke(result);
                     OnRadiationDataReceived?.Invoke(new Dictionary<string, float>(dict));
                 });
             }
@@ -246,7 +287,7 @@ public class RadiationReceiver : MonoBehaviour
         yield return new WaitForSeconds(qrStartDelayAfterConnect);
 
         if (qrScanner == null)
-            qrScanner = FindObjectOfType<QRScanner>();
+            qrScanner = FindFirstObjectByType<QRScanner>();
 
         if (qrScanner != null)
             qrScanner.StartScanning();
@@ -256,11 +297,16 @@ public class RadiationReceiver : MonoBehaviour
 
     private void UpdateStatus(string message, Color color)
     {
+        currentStatusMessage = message;
+        currentStatusColor = color;
+
         if (statusText != null)
         {
             statusText.text = message;
             statusText.color = color;
         }
+
+        OnServerStatusChanged?.Invoke(message, color);
     }
 
     private void Update()
