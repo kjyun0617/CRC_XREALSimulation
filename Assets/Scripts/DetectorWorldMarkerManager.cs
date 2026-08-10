@@ -89,6 +89,17 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField] private bool showDistanceInLabel = true;
     [SerializeField] private bool showAnchorStateInLabel = true;
 
+    [Header("Marker Label")]
+    [Tooltip("Camera-relative world offset from the sphere center. Positive X is screen-right and negative Y is screen-down.")]
+    [SerializeField] private Vector3 labelCameraOffsetMeters = new Vector3(0.16f, -0.13f, -0.01f);
+
+    [Tooltip("World-space scale of the label. This is kept independent of Fixed Marker Size.")]
+    [SerializeField, Min(0.001f)] private float labelWorldScale = 0.04f;
+
+    [SerializeField, Min(0.1f)] private float labelFontSize = 4.5f;
+    [SerializeField, Range(0f, 1f)] private float labelOutlineWidth = 0.2f;
+    [SerializeField] private Color labelOutlineColor = Color.black;
+
     [Header("Radiation Thresholds")]
     [SerializeField] private float safeMax = 0.3f;
     [SerializeField] private float warningMax = 1.0f;
@@ -131,8 +142,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         foreach (var kvp in markers)
         {
-            if (kvp.Value.label != null)
-                kvp.Value.label.transform.rotation = fallbackCamera.transform.rotation;
+            UpdateLabelTransform(kvp.Value);
         }
     }
 
@@ -694,18 +704,66 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     private TMP_Text CreateLabel(Transform parent, string detectorId)
     {
         GameObject labelObject = new GameObject($"Label_{detectorId}");
-        labelObject.transform.SetParent(parent);
-        labelObject.transform.localPosition = new Vector3(0f, 1.1f, 0f);
+        labelObject.transform.SetParent(parent, false);
+        labelObject.transform.localPosition = Vector3.zero;
         labelObject.transform.localRotation = Quaternion.identity;
-        labelObject.transform.localScale = Vector3.one * 0.08f;
 
         TMP_Text label = labelObject.AddComponent<TextMeshPro>();
         label.alignment = TextAlignmentOptions.Center;
-        label.fontSize = 2.5f;
+        label.fontSize = labelFontSize;
         label.text = detectorId;
         label.color = Color.white;
+        label.outlineWidth = labelOutlineWidth;
+        label.outlineColor = labelOutlineColor;
+
+        SetLabelWorldScale(label.transform);
 
         return label;
+    }
+
+    private void UpdateLabelTransform(MarkerInfo marker)
+    {
+        if (marker == null || marker.root == null || marker.label == null || fallbackCamera == null)
+            return;
+
+        Transform cameraTransform = fallbackCamera.transform;
+        Transform labelTransform = marker.label.transform;
+
+        labelTransform.position =
+            marker.root.transform.position +
+            cameraTransform.right * labelCameraOffsetMeters.x +
+            cameraTransform.up * labelCameraOffsetMeters.y +
+            cameraTransform.forward * labelCameraOffsetMeters.z;
+
+        labelTransform.rotation = cameraTransform.rotation;
+        SetLabelWorldScale(labelTransform);
+    }
+
+    private void SetLabelWorldScale(Transform labelTransform)
+    {
+        if (labelTransform == null)
+            return;
+
+        Transform parent = labelTransform.parent;
+        if (parent == null)
+        {
+            labelTransform.localScale = Vector3.one * labelWorldScale;
+            return;
+        }
+
+        Vector3 parentScale = parent.lossyScale;
+        labelTransform.localScale = new Vector3(
+            SafeScaleDivision(labelWorldScale, parentScale.x),
+            SafeScaleDivision(labelWorldScale, parentScale.y),
+            SafeScaleDivision(labelWorldScale, parentScale.z)
+        );
+    }
+
+    private float SafeScaleDivision(float desiredWorldScale, float parentScale)
+    {
+        return Mathf.Abs(parentScale) > 0.0001f
+            ? desiredWorldScale / Mathf.Abs(parentScale)
+            : desiredWorldScale;
     }
 
     private void UpdateMarkerVisual(MarkerInfo marker, float radiationValue)

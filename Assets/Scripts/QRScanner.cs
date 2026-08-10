@@ -78,6 +78,7 @@ public class QRScanner : MonoBehaviour
 
         WarnIfStatusTextIsChildOfPreview();
         SetPreviewVisible(false);
+        SetStatusVisible(false);
         UpdateStatus("QR scan ready");
     }
 
@@ -86,6 +87,7 @@ public class QRScanner : MonoBehaviour
         if (isStarting || isScanning)
             return;
 
+        SetStatusVisible(true);
         hasHandledCurrentResult = false;
         StartCoroutine(RequestPermissionAndStartCamera());
     }
@@ -103,6 +105,7 @@ public class QRScanner : MonoBehaviour
 
         StopCameraNow();
         SetPreviewVisible(false);
+        SetStatusVisible(false);
     }
 
     private void StopCameraNow()
@@ -146,6 +149,7 @@ public class QRScanner : MonoBehaviour
             isStarting = false;
             UpdateStatus("Camera permission denied");
             Debug.LogError("Camera permission denied.");
+            SetStatusVisible(false);
             yield break;
         }
 
@@ -161,6 +165,7 @@ public class QRScanner : MonoBehaviour
             isStarting = false;
             UpdateStatus("No camera found");
             Debug.LogError("No WebCamTexture camera found.");
+            SetStatusVisible(false);
             yield break;
         }
 
@@ -193,6 +198,7 @@ public class QRScanner : MonoBehaviour
             UpdateStatus("Camera failed to start");
             Debug.LogError("Camera failed to start.");
             StopScanning();
+            SetStatusVisible(false);
             yield break;
         }
 
@@ -320,7 +326,10 @@ public class QRScanner : MonoBehaviour
         OnQRDetectedDetailed?.Invoke(qrText, center, imageWidth, imageHeight, pixelSize);
 
         if (autoStopAfterFirstResult && !hidePreviewBeforeNotify)
+        {
             StopScanning();
+            SetStatusVisible(false);
+        }
     }
 
     private Vector2 CalculateCenter(ResultPoint[] points, int imageWidth, int imageHeight)
@@ -374,7 +383,11 @@ public class QRScanner : MonoBehaviour
 
         Debug.Log(message);
     }
-
+    private void SetStatusVisible(bool visible)
+    {
+        if (statusText != null)
+            statusText.gameObject.SetActive(visible);
+    }
     private void WarnIfStatusTextIsChildOfPreview()
     {
         if (cameraPreview == null || statusText == null)
