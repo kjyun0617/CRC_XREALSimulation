@@ -754,6 +754,13 @@ MonoBehaviour:
   placementOrigin: {fileID: 876944438}
   fallbackCamera: {fileID: 609993946}
   markerPrefab: {fileID: 0}
+  usePlaneIntersectionPlacement: 1
+  planeManager: {fileID: 624047417}
+  planeDetectionMode: 3
+  minPlaneHitDistanceMeters: 0.15
+  maxPlaneHitDistanceMeters: 10
+  hidePreviewWithoutPlaneHit: 1
+  waitingForPlaneStateLabel: aim at a detected plane
   useCoordinateDatabase: 1
   coordinateDatabase: {fileID: 906282734}
   loadSavedCoordinatesOnStart: 0
@@ -855,7 +862,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 624047408}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: e1760703bbd54c04488a8d10600262ab, type: 3}
   m_Name: 
@@ -864,7 +871,7 @@ MonoBehaviour:
     m_PersistentCalls:
       m_Calls: []
   m_PlanePrefab: {fileID: 0}
-  m_DetectionMode: 1
+  m_DetectionMode: 3
 --- !u!1001 &694392833
 PrefabInstance:
   m_ObjectHideFlags: 0

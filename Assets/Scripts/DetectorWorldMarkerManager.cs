@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using TMPro;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
+using UnityEngine.XR.ARSubsystems;
 
 /// <summary>
 /// Preview-center detector placement flow.
@@ -20,6 +21,28 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     [Tooltip("Optional. If empty, the script creates a sphere automatically.")]
     [SerializeField] private GameObject markerPrefab;
+
+    [Header("Plane Intersection Placement")]
+    [Tooltip("ON = place the preview at the intersection between the glasses' center gaze ray and a detected AR plane.")]
+    [SerializeField] private bool usePlaneIntersectionPlacement = true;
+
+    [Tooltip("ARPlaneManager on the XR Origin. It is found and enabled automatically when empty.")]
+    [SerializeField] private ARPlaneManager planeManager;
+
+    [Tooltip("Plane types to detect. XREAL supports horizontal and vertical planes.")]
+    [SerializeField] private PlaneDetectionMode planeDetectionMode =
+        PlaneDetectionMode.Horizontal | PlaneDetectionMode.Vertical;
+
+    [Tooltip("Minimum gaze-ray distance accepted as a placement point.")]
+    [SerializeField, Min(0f)] private float minPlaneHitDistanceMeters = 0.15f;
+
+    [Tooltip("Maximum gaze-ray distance searched for a placement point.")]
+    [SerializeField, Min(0.1f)] private float maxPlaneHitDistanceMeters = 10f;
+
+    [Tooltip("Hide the detector preview until the center gaze ray intersects a detected plane polygon.")]
+    [SerializeField] private bool hidePreviewWithoutPlaneHit = true;
+
+    [SerializeField] private string waitingForPlaneStateLabel = "aim at a detected plane";
 
     [Header("Coordinate Storage")]
     [SerializeField] private bool useCoordinateDatabase = true;
@@ -106,6 +129,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private readonly Dictionary<string, MarkerInfo> markers = new Dictionary<string, MarkerInfo>();
     private bool spatialEventsSubscribed = false;
+    private bool warnedAboutMissingPlaneManager = false;
     private string currentFollowingDetectorId = "";
 
     private void OnEnable()
@@ -124,6 +148,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     private void Start()
     {
         EnsurePlacementOrigin();
+        EnsurePlaneDetectionManager();
         EnsureCoordinateDatabase();
         EnsureSpatialAnchorManager();
         SubscribeSpatialEvents();
@@ -193,10 +218,13 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                     marker.renderer.enabled = true;
             }
 
-            UpdateFollowingMarkerPosition(marker);
             UpdateMarkerVisual(marker, marker.lastRadiationValue);
+            UpdateFollowingMarkerPosition(marker);
 
-            Debug.Log($"[DetectorWorldMarkerManager] Detector preview following gaze: {detectorId}, distance={defaultPlacementDistanceMeters:F2}m");
+            string previewMode = usePlaneIntersectionPlacement
+                ? "gaze-center plane intersection"
+                : $"fixed distance ({defaultPlacementDistanceMeters:F2}m)";
+            Debug.Log($"[DetectorWorldMarkerManager] Detector preview started: {detectorId}, mode={previewMode}");
             return;
         }
 
@@ -258,6 +286,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             return;
         }
 
+        if (usePlaneIntersectionPlacement)
+        {
+            UpdateFollowingMarkerFromPlaneIntersection(marker);
+            return;
+        }
+
         float distance = defaultPlacementDistanceMeters;
 
         Vector3 direction = placementOrigin.forward.sqrMagnitude > 0.0001f
@@ -278,6 +312,138 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         marker.savedPosition = worldPosition;
         marker.lastEstimatedDistance = distance;
         marker.anchorState = followingStateLabel;
+        marker.hasValidPlaneHit = false;
+    }
+
+    private void UpdateFollowingMarkerFromPlaneIntersection(MarkerInfo marker)
+    {
+        if (!TryGetGazePlaneIntersection(out Vector3 hitPosition, out Quaternion hitRotation, out float hitDistance))
+        {
+            marker.hasValidPlaneHit = false;
+            marker.anchorState = waitingForPlaneStateLabel;
+
+            if (hidePreviewWithoutPlaneHit && marker.root != null)
+                marker.root.SetActive(false);
+
+            return;
+        }
+
+        marker.hasValidPlaneHit = true;
+        marker.root.SetActive(true);
+        marker.root.transform.position = hitPosition;
+        marker.root.transform.rotation = hitRotation;
+        marker.root.transform.localScale = Vector3.one * fixedMarkerSize;
+
+        if (marker.renderer != null)
+            marker.renderer.enabled = true;
+
+        marker.savedPosition = hitPosition;
+        marker.lastEstimatedDistance = hitDistance;
+        marker.lastPlacementMethod = "GazeCenterPlaneIntersection";
+        marker.anchorState = $"{followingStateLabel} (plane)";
+    }
+
+    private bool TryGetGazePlaneIntersection(
+        out Vector3 hitPosition,
+        out Quaternion hitRotation,
+        out float hitDistance)
+    {
+        hitPosition = Vector3.zero;
+        hitRotation = Quaternion.identity;
+        hitDistance = 0f;
+
+        EnsurePlacementOrigin();
+        EnsurePlaneDetectionManager();
+
+        if (placementOrigin == null || planeManager == null || !planeManager.enabled)
+            return false;
+
+        Vector3 gazeDirection = placementOrigin.forward.normalized;
+        if (gazeDirection.sqrMagnitude < 0.0001f)
+            return false;
+
+        Ray gazeRay = new Ray(placementOrigin.position, gazeDirection);
+        float closestDistance = float.PositiveInfinity;
+        ARPlane closestPlane = null;
+        Vector3 closestPosition = Vector3.zero;
+
+        foreach (ARPlane plane in planeManager.trackables)
+        {
+            if (plane == null || !plane.gameObject.activeInHierarchy || plane.trackingState == TrackingState.None)
+                continue;
+
+            Vector3 planeNormal = plane.transform.up;
+            float denominator = Vector3.Dot(gazeRay.direction, planeNormal);
+            if (Mathf.Abs(denominator) < 0.0001f)
+                continue;
+
+            float distance = Vector3.Dot(plane.transform.position - gazeRay.origin, planeNormal) / denominator;
+            if (distance < minPlaneHitDistanceMeters ||
+                distance > maxPlaneHitDistanceMeters ||
+                distance >= closestDistance)
+            {
+                continue;
+            }
+
+            Vector3 candidatePosition = gazeRay.GetPoint(distance);
+            if (!IsPointInsidePlaneBoundary(plane, candidatePosition))
+                continue;
+
+            closestDistance = distance;
+            closestPosition = candidatePosition;
+            closestPlane = plane;
+        }
+
+        if (closestPlane == null)
+            return false;
+
+        hitPosition = closestPosition;
+        hitRotation = closestPlane.transform.rotation;
+        hitDistance = closestDistance;
+        return true;
+    }
+
+    private bool IsPointInsidePlaneBoundary(ARPlane plane, Vector3 worldPoint)
+    {
+        Vector3 localPoint3D = plane.transform.InverseTransformPoint(worldPoint);
+        Vector2 localPoint = new Vector2(localPoint3D.x, localPoint3D.z);
+        var boundary = plane.boundary;
+
+        if (boundary.IsCreated && boundary.Length >= 3)
+        {
+            bool inside = false;
+            int previous = boundary.Length - 1;
+
+            for (int current = 0; current < boundary.Length; current++)
+            {
+                Vector2 a = boundary[current];
+                Vector2 b = boundary[previous];
+
+                bool crossesY = (a.y > localPoint.y) != (b.y > localPoint.y);
+                if (crossesY)
+                {
+                    float intersectionX =
+                        (b.x - a.x) * (localPoint.y - a.y) /
+                        (b.y - a.y) + a.x;
+
+                    if (localPoint.x < intersectionX)
+                        inside = !inside;
+                }
+
+                previous = current;
+            }
+
+            return inside;
+        }
+
+        // Boundary data can be briefly unavailable on the first tracking frame.
+        // Fall back to the plane's rectangular size until its polygon arrives.
+        Vector2 halfSize = plane.size * 0.5f;
+        Vector3 planeCenter3D = plane.center;
+        Vector2 planeCenter = new Vector2(planeCenter3D.x, planeCenter3D.z);
+        Vector2 pointFromCenter = localPoint - planeCenter;
+        return Mathf.Abs(pointFromCenter.x) <= halfSize.x &&
+               Mathf.Abs(pointFromCenter.y) <= halfSize.y;
     }
 
     public void PlaceDetector()
@@ -321,6 +487,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (marker.isFollowingPlacementOrigin && !marker.isPlaced)
             UpdateFollowingMarkerPosition(marker);
 
+        if (usePlaneIntersectionPlacement && !marker.hasValidPlaneHit)
+        {
+            Debug.LogWarning($"[DetectorWorldMarkerManager] PlaceDetector blocked. The center gaze ray is not intersecting a detected plane: {detectorId}");
+            return;
+        }
+
         marker.isFollowingPlacementOrigin = false;
         marker.isPlaced = true;
         marker.savedPosition = marker.root.transform.position;
@@ -338,7 +510,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             detectorId,
             marker.savedPosition,
             worldRotation,
-            defaultPlacementDistanceMeters,
+            marker.lastEstimatedDistance,
             marker.lastQrPixelSize,
             marker.lastPlacementImagePoint,
             marker.lastImageWidth,
@@ -351,7 +523,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         ForceMarkerVisible(marker);
         UpdateMarkerVisual(marker, marker.lastRadiationValue);
-        Debug.Log($"[DetectorWorldMarkerManager] Detector fixed: {detectorId}, pos={marker.savedPosition}, distance={defaultPlacementDistanceMeters:F2}m");
+        Debug.Log($"[DetectorWorldMarkerManager] Detector fixed: {detectorId}, pos={marker.savedPosition}, distance={marker.lastEstimatedDistance:F2}m, method={placementMethod}");
     }
 
     public void CancelCurrentFollowingDetector()
@@ -462,6 +634,32 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         if (placementOrigin == null && fallbackCamera != null)
             placementOrigin = fallbackCamera.transform;
+    }
+
+    private void EnsurePlaneDetectionManager()
+    {
+        if (!usePlaneIntersectionPlacement)
+            return;
+
+        if (planeManager == null)
+            planeManager = FindFirstObjectByType<ARPlaneManager>(FindObjectsInactive.Include);
+
+        if (planeManager == null)
+        {
+            if (!warnedAboutMissingPlaneManager)
+            {
+                Debug.LogError("[DetectorWorldMarkerManager] Plane intersection placement requires an ARPlaneManager on the XR Origin.");
+                warnedAboutMissingPlaneManager = true;
+            }
+
+            return;
+        }
+
+        warnedAboutMissingPlaneManager = false;
+        planeManager.requestedDetectionMode = planeDetectionMode;
+
+        if (!planeManager.enabled)
+            planeManager.enabled = true;
     }
 
     private void EnsureCoordinateDatabase()
@@ -796,7 +994,17 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         // Radiation value affects color only. Size always stays fixed.
         marker.root.transform.localScale = Vector3.one * fixedMarkerSize;
-        ForceMarkerVisible(marker);
+
+        bool waitingForPlaneHit =
+            usePlaneIntersectionPlacement &&
+            marker.isFollowingPlacementOrigin &&
+            !marker.hasValidPlaneHit;
+
+        if (waitingForPlaneHit && hidePreviewWithoutPlaneHit)
+            marker.root.SetActive(false);
+        else
+            ForceMarkerVisible(marker);
+
         UpdateLabel(marker, radiationValue, false);
     }
 
@@ -1002,6 +1210,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         public string lastPlacementMethod;
         public bool isFollowingPlacementOrigin;
         public bool isPlaced;
+        public bool hasValidPlaneHit;
         public ARAnchor anchor;
         public string anchorGuid;
         public string anchorState;
