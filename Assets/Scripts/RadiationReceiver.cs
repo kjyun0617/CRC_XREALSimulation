@@ -1,20 +1,21 @@
 using System.Collections;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
 using NativeWebSocket;
 using Newtonsoft.Json.Linq;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
-using ZXing;
 
 
 public class RadiationReceiver : MonoBehaviour
 {
+    private const string ServerIpPlayerPrefsKey = "ServerIP";
+    private const string WaitingForDataMessage = "Waiting for radiation data...";
+
     public delegate void DisplayTextChangedSignature(string message);
     public static event DisplayTextChangedSignature OnDisplayTextChanged;
 
-    private string currentDisplayMessage = "";
+    private string currentDisplayMessage = WaitingForDataMessage;
 
     public string CurrentDisplayMessage => currentDisplayMessage;
     public delegate void RadiationDataReceivedSignature(Dictionary<string, float> deviceData);
@@ -51,15 +52,23 @@ public class RadiationReceiver : MonoBehaviour
 
     public string CurrentStatusMessage => currentStatusMessage;
     public Color CurrentStatusColor => currentStatusColor;
+    public string CurrentServerIp => string.IsNullOrWhiteSpace(savedIp) ? defaultIp : savedIp;
+    public bool IsConnected => websocket != null && websocket.State == WebSocketState.Open;
+    public bool IsConnecting => isConnecting;
 
 #if UNITY_ANDROID && !UNITY_EDITOR
     private TouchScreenKeyboard activeKeyboard;
 #endif
 
+    private void Awake()
+    {
+        // Load this in Awake so controller prefabs created during scene startup can
+        // immediately copy the saved IP before this component's Start runs.
+        savedIp = PlayerPrefs.GetString(ServerIpPlayerPrefsKey, defaultIp);
+    }
+
     private void Start()
     {
-        savedIp = PlayerPrefs.GetString("ServerIP", defaultIp);
-
         if (ipInputField != null)
         {
             ipInputField.text = savedIp;
@@ -72,6 +81,7 @@ public class RadiationReceiver : MonoBehaviour
         if (qrScanner == null)
             qrScanner = FindFirstObjectByType<QRScanner>();
 
+        UpdateDisplay(WaitingForDataMessage);
         UpdateStatus("Disconnected", Color.red);
 
         if (openKeyboardOnStart)
@@ -171,7 +181,7 @@ public class RadiationReceiver : MonoBehaviour
         if (string.IsNullOrEmpty(ip)) return;
 
         savedIp = ip;
-        PlayerPrefs.SetString("ServerIP", savedIp);
+        PlayerPrefs.SetString(ServerIpPlayerPrefsKey, savedIp);
         PlayerPrefs.Save();
     }
 
@@ -248,12 +258,7 @@ public class RadiationReceiver : MonoBehaviour
 
                 UnityMainThreadDispatcher.Enqueue(() =>
                 {
-                    currentDisplayMessage = result;
-
-                    if (displayText != null)
-                        displayText.text = result;
-
-                    OnDisplayTextChanged?.Invoke(result);
+                    UpdateDisplay(result);
                     OnRadiationDataReceived?.Invoke(new Dictionary<string, float>(dict));
                 });
             }
@@ -279,7 +284,16 @@ public class RadiationReceiver : MonoBehaviour
                 UpdateStatus("Disconnected", Color.red));
         };
 
-        await websocket.Connect();
+        try
+        {
+            await websocket.Connect();
+        }
+        catch (System.Exception e)
+        {
+            isConnecting = false;
+            Debug.LogError($"WebSocket connection failed: {e.Message}");
+            UpdateStatus($"Connection failed: {e.Message}", Color.red);
+        }
     }
 
     private IEnumerator StartQrCameraAfterDelay()
@@ -307,6 +321,18 @@ public class RadiationReceiver : MonoBehaviour
         }
 
         OnServerStatusChanged?.Invoke(message, color);
+    }
+
+    private void UpdateDisplay(string message)
+    {
+        currentDisplayMessage = string.IsNullOrEmpty(message)
+            ? WaitingForDataMessage
+            : message;
+
+        if (displayText != null)
+            displayText.text = currentDisplayMessage;
+
+        OnDisplayTextChanged?.Invoke(currentDisplayMessage);
     }
 
     private void Update()

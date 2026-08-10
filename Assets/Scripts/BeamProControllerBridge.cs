@@ -15,6 +15,8 @@ using UnityEngine;
 /// </summary>
 public class BeamProControllerBridge : MonoBehaviour
 {
+    private const string WaitingForDataMessage = "Waiting for radiation data...";
+
     [Header("Scene Managers")]
     [SerializeField] private DetectorWorldMarkerManager markerManager;
     [SerializeField] private QRScanner qrScanner;
@@ -38,7 +40,7 @@ public class BeamProControllerBridge : MonoBehaviour
     private void Awake()
     {
         ResolveReferences();
-        SetStatus("Controller UI ready");
+        SyncControllerIpField();
     }
 
     private void OnEnable()
@@ -46,6 +48,8 @@ public class BeamProControllerBridge : MonoBehaviour
         ResolveReferences();
         RadiationReceiver.OnServerStatusChanged += HandleServerStatusChanged;
         RadiationReceiver.OnDisplayTextChanged += HandleDisplayTextChanged;
+        RegisterControllerIpListener();
+        SyncControllerIpField();
         SyncCurrentReceiverText();
     }
 
@@ -54,6 +58,9 @@ public class BeamProControllerBridge : MonoBehaviour
         RadiationReceiver.OnServerStatusChanged -= HandleServerStatusChanged;
 
         RadiationReceiver.OnDisplayTextChanged -= HandleDisplayTextChanged;
+
+        if (controllerIpInputField != null)
+            controllerIpInputField.onEndEdit.RemoveListener(HandleControllerIpEndEdit);
     }
 
     /// <summary>
@@ -62,7 +69,8 @@ public class BeamProControllerBridge : MonoBehaviour
     public void RefreshReferences()
     {
         ResolveReferences();
-        SetStatus("References refreshed");
+        SyncControllerIpField();
+        SyncCurrentReceiverText();
     }
 
     /// <summary>
@@ -118,6 +126,14 @@ public class BeamProControllerBridge : MonoBehaviour
         ConnectToServer();
     }
 
+    private void HandleControllerIpEndEdit(string ip)
+    {
+        if (string.IsNullOrWhiteSpace(ip))
+            return;
+
+        ConnectToServer();
+    }
+
     private void HandleServerStatusChanged(
         string message,
         Color color)
@@ -140,7 +156,10 @@ public class BeamProControllerBridge : MonoBehaviour
     private void SyncCurrentReceiverText()
     {
         if (radiationReceiver == null)
+        {
+            HandleDisplayTextChanged(WaitingForDataMessage);
             return;
+        }
 
         HandleServerStatusChanged(
             radiationReceiver.CurrentStatusMessage,
@@ -156,6 +175,10 @@ public class BeamProControllerBridge : MonoBehaviour
     {
         ResolveReferences();
 
+        // The controller prefab has no separate Connect button. Starting a scan
+        // must therefore also use the entered/saved IP when no connection exists.
+        ConnectIfNeeded();
+
         if (qrScanner == null)
         {
             Warn("QRScanner not found. Cannot start QR scan.");
@@ -163,7 +186,6 @@ public class BeamProControllerBridge : MonoBehaviour
         }
 
         qrScanner.StartScanning();
-        SetStatus("QR scan started");
         Log("StartQrScan");
     }
 
@@ -178,7 +200,6 @@ public class BeamProControllerBridge : MonoBehaviour
         }
 
         qrScanner.StopScanning();
-        SetStatus("QR scan stopped");
         Log("StopQrScan");
     }
 
@@ -199,7 +220,6 @@ public class BeamProControllerBridge : MonoBehaviour
         }
 
         markerManager.PlaceDetector();
-        SetStatus("Detector placed");
         Log("PlaceDetector");
     }
 
@@ -219,7 +239,6 @@ public class BeamProControllerBridge : MonoBehaviour
         }
 
         markerManager.CancelCurrentFollowingDetector();
-        SetStatus("Placement cancelled");
         Log("CancelPlace");
     }
 
@@ -239,7 +258,6 @@ public class BeamProControllerBridge : MonoBehaviour
         }
 
         markerManager.ClearSavedMarkers();
-        SetStatus("Markers cleared");
         Log("ClearSavedMarkers");
     }
 
@@ -254,8 +272,43 @@ public class BeamProControllerBridge : MonoBehaviour
         }
 
         markerManager.PrintSavedCoordinatesToLog();
-        SetStatus("Coordinates printed to log");
         Log("PrintSavedCoordinates");
+    }
+
+    private void RegisterControllerIpListener()
+    {
+        if (controllerIpInputField == null)
+            return;
+
+        // Remove first so re-enabling the controller cannot register duplicates.
+        controllerIpInputField.onEndEdit.RemoveListener(HandleControllerIpEndEdit);
+        controllerIpInputField.onEndEdit.AddListener(HandleControllerIpEndEdit);
+    }
+
+    private void SyncControllerIpField()
+    {
+        if (controllerIpInputField == null || radiationReceiver == null)
+            return;
+
+        if (string.IsNullOrWhiteSpace(controllerIpInputField.text))
+            controllerIpInputField.SetTextWithoutNotify(radiationReceiver.CurrentServerIp);
+    }
+
+    private void ConnectIfNeeded()
+    {
+        if (radiationReceiver == null ||
+            radiationReceiver.IsConnected ||
+            radiationReceiver.IsConnecting)
+        {
+            return;
+        }
+
+        string ip = controllerIpInputField != null
+            ? controllerIpInputField.text.Trim()
+            : radiationReceiver.CurrentServerIp;
+
+        if (!string.IsNullOrWhiteSpace(ip))
+            radiationReceiver.ConnectToServerWithIp(ip);
     }
 
     private void ResolveReferences()
@@ -273,12 +326,6 @@ public class BeamProControllerBridge : MonoBehaviour
             radiationReceiver = UnityEngine.Object.FindFirstObjectByType<RadiationReceiver>();
     }
 
-    private void SetStatus(string message)
-    {
-        if (controllerStatusText != null)
-            controllerStatusText.text = message;
-    }
-
     private void Log(string message)
     {
         if (logActions)
@@ -287,7 +334,6 @@ public class BeamProControllerBridge : MonoBehaviour
 
     private void Warn(string message)
     {
-        SetStatus(message);
         Debug.LogWarning($"[BeamProControllerBridge] {message}");
     }
 
