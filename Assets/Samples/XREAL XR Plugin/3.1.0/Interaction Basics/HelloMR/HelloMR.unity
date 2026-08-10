@@ -1880,13 +1880,13 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6779dc4189159a3449721cf4dcf24872, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  displayText: {fileID: 211346758}
+  displayText: {fileID: 0}
   ipInputField: {fileID: 1011247523}
   connectButton: {fileID: 0}
-  statusText: {fileID: 1094413954}
+  statusText: {fileID: 0}
   defaultIp: 192.168.0.60
   serverPort: 5002
-  openKeyboardOnStart: 1
+  openKeyboardOnStart: 0
   keyboardOpenDelay: 0.5
   connectWhenKeyboardDone: 1
   qrScanner: {fileID: 732363537}
