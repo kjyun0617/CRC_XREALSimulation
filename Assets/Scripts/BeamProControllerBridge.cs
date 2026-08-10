@@ -70,25 +70,18 @@ public class BeamProControllerBridge : MonoBehaviour
     /// </summary>
     public void OpenIpInput()
     {
-        ResolveReferences();
-
-        if (controllerIpInputField != null)
+        if (controllerIpInputField == null)
         {
-            controllerIpInputField.Select();
-            controllerIpInputField.ActivateInputField();
-            controllerIpInputField.caretPosition = controllerIpInputField.text.Length;
+            Warn("Controller IP input field is missing.");
+            return;
         }
 
-        if (radiationReceiver != null)
-        {
-            radiationReceiver.StartIpInput();
-            SetStatus("Enter server IP");
-            Log("OpenIpInput");
-        }
-        else
-        {
-            Warn("RadiationReceiver not found. Cannot open IP input.");
-        }
+        controllerIpInputField.Select();
+        controllerIpInputField.ActivateInputField();
+        controllerIpInputField.caretPosition =
+            controllerIpInputField.text.Length;
+
+        Log("Controller IP input focused");
     }
 
     /// <summary>
