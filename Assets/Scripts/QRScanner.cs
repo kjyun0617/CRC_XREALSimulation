@@ -16,7 +16,7 @@ using UnityEngine.Android;
 /// - Stops camera preview immediately after a QR is detected.
 /// - Fires both legacy and detailed QR events.
 /// - Still notifies placement managers even when the same QR is scanned again.
-/// - Does not hide the status text when the preview is hidden.
+/// - Shows the QR status text only while the scanner is starting or scanning.
 /// </summary>
 public class QRScanner : MonoBehaviour
 {
@@ -381,13 +381,18 @@ public class QRScanner : MonoBehaviour
         if (statusText != null)
             statusText.text = message;
 
+        // Updating the message must never make QR instructions remain visible
+        // after detection. Visibility follows the actual scanner lifecycle.
+        SetStatusVisible(isStarting || isScanning);
         Debug.Log(message);
     }
+
     private void SetStatusVisible(bool visible)
     {
         if (statusText != null)
             statusText.gameObject.SetActive(visible);
     }
+
     private void WarnIfStatusTextIsChildOfPreview()
     {
         if (cameraPreview == null || statusText == null)

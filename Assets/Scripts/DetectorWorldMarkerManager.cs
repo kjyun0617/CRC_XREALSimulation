@@ -357,16 +357,33 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     public void CancelCurrentFollowingDetector()
     {
         if (string.IsNullOrEmpty(currentFollowingDetectorId))
-            return;
-
-        if (markers.TryGetValue(currentFollowingDetectorId, out MarkerInfo marker) && marker != null)
         {
-            marker.isFollowingPlacementOrigin = false;
-            marker.anchorState = "cancelled";
-            UpdateLabel(marker, marker.lastRadiationValue, false);
+            Debug.LogWarning("[DetectorWorldMarkerManager] Cancel called, but no detector preview is currently following the view center.");
+            return;
         }
 
+        string detectorId = currentFollowingDetectorId;
         currentFollowingDetectorId = "";
+
+        if (!markers.TryGetValue(detectorId, out MarkerInfo marker) || marker == null)
+        {
+            Debug.LogWarning($"[DetectorWorldMarkerManager] Cancel failed. Marker not found: {detectorId}");
+            return;
+        }
+
+        marker.isFollowingPlacementOrigin = false;
+        marker.isPlaced = false;
+        markers.Remove(detectorId);
+
+        // Hide immediately, then destroy the cancelled preview. Removing it from
+        // the dictionary also prevents later radiation updates from showing it again.
+        if (marker.root != null)
+        {
+            marker.root.SetActive(false);
+            Destroy(marker.root);
+        }
+
+        Debug.Log($"[DetectorWorldMarkerManager] Detector placement cancelled and preview removed: {detectorId}");
     }
 
     private string NormalizeDetectorId(string rawQrText)
