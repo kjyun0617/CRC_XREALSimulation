@@ -105,7 +105,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [Tooltip("Fixed world scale of every detector sphere. Radiation value changes color only, not size.")]
     [SerializeField] private float fixedMarkerSize = 0.20f;
 
-    [Tooltip("Alpha value for transparent detector sphere. 0 = invisible, 1 = opaque.")]
+    [Tooltip("Visible pixel coverage of the detector sphere. 0.35 keeps 35% of pixels and opens 65% as real see-through holes on XREAL.")]
     [SerializeField, Range(0.05f, 1.0f)] private float markerAlpha = 0.35f;
 
     [Tooltip("Use the included RadVis transparent shader so XREAL builds cannot fall back to an opaque material mode.")]

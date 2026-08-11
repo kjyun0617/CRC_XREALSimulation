@@ -18,7 +18,10 @@ Shader "RadVis/DetectorTransparent"
         Cull Back
         ZWrite Off
         ZTest LEqual
-        Blend SrcAlpha OneMinusSrcAlpha
+        // XREAL optical displays can make bright RGB look opaque even when normal
+        // alpha blending is configured. Kept pixels are opaque and the fragment
+        // shader physically removes the rest, creating reliable screen-door transparency.
+        Blend One Zero
 
         Pass
         {
@@ -54,7 +57,12 @@ Shader "RadVis/DetectorTransparent"
 
             fixed4 Frag(Varyings input) : SV_Target
             {
-                return _Color;
+                // Stable screen-space interleaved noise. _Color.a is the fraction
+                // of pixels that remain visible (0.35 = 35% visible, 65% real holes).
+                float2 pixel = floor(input.position.xy);
+                float dither = frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+                clip(_Color.a - dither);
+                return fixed4(_Color.rgb, 1.0);
             }
             ENDCG
         }
