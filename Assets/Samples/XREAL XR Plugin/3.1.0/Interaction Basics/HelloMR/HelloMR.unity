@@ -789,6 +789,7 @@ MonoBehaviour:
   rescanPositionBlend: 0.55
   fixedMarkerSize: 0.2
   markerAlpha: 0.35
+  forceDedicatedTransparentShader: 1
   showLabel: 0
   showDistanceInLabel: 1
   showAnchorStateInLabel: 1
@@ -821,7 +822,7 @@ MonoBehaviour:
   hudPixelSize: {x: 720, y: 430}
   hudFontSize: 27
   radiationUnit: uSv/h
-  gazeSelectionAngleDegrees: 4
+  gazeSelectionAngleDegrees: 8
   screenEdgeMargin: 0.05
   indicatorFontSize: 28
 --- !u!4 &588933900

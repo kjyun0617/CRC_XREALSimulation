@@ -108,6 +108,9 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [Tooltip("Alpha value for transparent detector sphere. 0 = invisible, 1 = opaque.")]
     [SerializeField, Range(0.05f, 1.0f)] private float markerAlpha = 0.35f;
 
+    [Tooltip("Use the included RadVis transparent shader so XREAL builds cannot fall back to an opaque material mode.")]
+    [SerializeField] private bool forceDedicatedTransparentShader = true;
+
     [SerializeField] private bool showLabel = false;
     [SerializeField] private bool showDistanceInLabel = true;
     [SerializeField] private bool showAnchorStateInLabel = true;
@@ -138,6 +141,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     private bool spatialEventsSubscribed = false;
     private bool warnedAboutMissingPlaneManager = false;
     private string currentFollowingDetectorId = "";
+    private Shader cachedDetectorTransparentShader;
 
     private void OnEnable()
     {
@@ -923,12 +927,17 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         Renderer renderer = sphere.GetComponent<Renderer>();
         if (renderer != null)
         {
-            Shader shader = Shader.Find("Universal Render Pipeline/Lit");
+            Shader shader = GetDetectorTransparentShader();
+            if (shader == null)
+                shader = Shader.Find("Universal Render Pipeline/Lit");
             if (shader == null)
                 shader = Shader.Find("Standard");
 
             if (shader != null)
                 renderer.material = new Material(shader);
+
+            renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
         }
 
         Collider collider = sphere.GetComponent<Collider>();
@@ -1065,6 +1074,14 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             return;
 
         Material material = renderer.material;
+
+        if (forceDedicatedTransparentShader)
+        {
+            Shader transparentShader = GetDetectorTransparentShader();
+            if (transparentShader != null && material.shader != transparentShader)
+                material.shader = transparentShader;
+        }
+
         ConfigureTransparentMaterial(material);
 
         if (material.HasProperty("_BaseColor"))
@@ -1087,20 +1104,35 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (material.HasProperty("_AlphaClip"))
             material.SetFloat("_AlphaClip", 0f);
         if (material.HasProperty("_SrcBlend"))
-            material.SetFloat("_SrcBlend", (float)UnityEngine.Rendering.BlendMode.SrcAlpha);
+            material.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
         if (material.HasProperty("_DstBlend"))
-            material.SetFloat("_DstBlend", (float)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+            material.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
         if (material.HasProperty("_ZWrite"))
-            material.SetFloat("_ZWrite", 0f);
+            material.SetInt("_ZWrite", 0);
 
+        material.SetOverrideTag("RenderType", "Transparent");
         material.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
         material.EnableKeyword("_ALPHABLEND_ON");
         material.DisableKeyword("_ALPHATEST_ON");
+        material.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+        material.DisableKeyword("_ALPHAMODULATE_ON");
+        material.SetShaderPassEnabled("ShadowCaster", false);
         material.renderQueue = (int)UnityEngine.Rendering.RenderQueue.Transparent;
 
-        // Built-in Standard shader transparent setup.
+        // Built-in Standard shader Fade mode matches SrcAlpha/OneMinusSrcAlpha.
         if (material.HasProperty("_Mode"))
-            material.SetFloat("_Mode", 3f);
+            material.SetFloat("_Mode", 2f);
+    }
+
+    private Shader GetDetectorTransparentShader()
+    {
+        if (cachedDetectorTransparentShader == null)
+            cachedDetectorTransparentShader = Resources.Load<Shader>("RadVisDetectorTransparent");
+
+        if (cachedDetectorTransparentShader == null)
+            cachedDetectorTransparentShader = Shader.Find("RadVis/DetectorTransparent");
+
+        return cachedDetectorTransparentShader;
     }
 
     private void UpdateLabel(MarkerInfo marker, float radiationValue, bool moved)

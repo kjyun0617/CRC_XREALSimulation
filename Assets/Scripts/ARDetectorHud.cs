@@ -34,7 +34,7 @@ public class ARDetectorHud : MonoBehaviour
 
     [Header("Gaze Selection")]
     [Tooltip("A placed sphere is selected when it is this close to the view-center ray.")]
-    [SerializeField, Range(1f, 12f)] private float gazeSelectionAngleDegrees = 4f;
+    [SerializeField, Range(1f, 20f)] private float gazeSelectionAngleDegrees = 8f;
 
     [Header("Off-screen Indicators")]
     [SerializeField, Range(0f, 0.15f)] private float screenEdgeMargin = 0.05f;
