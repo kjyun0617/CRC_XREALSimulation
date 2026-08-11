@@ -16,8 +16,10 @@ public class RadiationReceiver : MonoBehaviour
     public static event DisplayTextChangedSignature OnDisplayTextChanged;
 
     private string currentDisplayMessage = WaitingForDataMessage;
+    private readonly Dictionary<string, float> latestDeviceData = new Dictionary<string, float>();
 
     public string CurrentDisplayMessage => currentDisplayMessage;
+    public IReadOnlyDictionary<string, float> LatestDeviceData => latestDeviceData;
     public delegate void RadiationDataReceivedSignature(Dictionary<string, float> deviceData);
     public static event RadiationDataReceivedSignature OnRadiationDataReceived;
 
@@ -223,6 +225,7 @@ public class RadiationReceiver : MonoBehaviour
         if (websocket != null && websocket.State == WebSocketState.Open)
             await websocket.Close();
 
+        ReplaceLatestDeviceData(null);
         UpdateStatus($"Connecting to... {url}", Color.yellow);
 
         websocket = new WebSocket(url);
@@ -234,6 +237,7 @@ public class RadiationReceiver : MonoBehaviour
 
             UnityMainThreadDispatcher.Enqueue(() =>
             {
+                ReplaceLatestDeviceData(null);
                 UpdateStatus($"Connected: {cleanIp}", Color.green);
 
                 if (startQrCameraAfterConnect)
@@ -258,6 +262,7 @@ public class RadiationReceiver : MonoBehaviour
 
                 UnityMainThreadDispatcher.Enqueue(() =>
                 {
+                    ReplaceLatestDeviceData(dict);
                     UpdateDisplay(result);
                     OnRadiationDataReceived?.Invoke(new Dictionary<string, float>(dict));
                 });
@@ -273,7 +278,10 @@ public class RadiationReceiver : MonoBehaviour
             Debug.LogError($"Error: {e}");
             isConnecting = false;
             UnityMainThreadDispatcher.Enqueue(() =>
-                UpdateStatus($"Error: {e}", Color.red));
+            {
+                ReplaceLatestDeviceData(null);
+                UpdateStatus($"Error: {e}", Color.red);
+            });
         };
 
         websocket.OnClose += (e) =>
@@ -281,7 +289,10 @@ public class RadiationReceiver : MonoBehaviour
             Debug.Log("Disconnected");
             isConnecting = false;
             UnityMainThreadDispatcher.Enqueue(() =>
-                UpdateStatus("Disconnected", Color.red));
+            {
+                ReplaceLatestDeviceData(null);
+                UpdateStatus("Disconnected", Color.red);
+            });
         };
 
         try
@@ -292,8 +303,20 @@ public class RadiationReceiver : MonoBehaviour
         {
             isConnecting = false;
             Debug.LogError($"WebSocket connection failed: {e.Message}");
+            ReplaceLatestDeviceData(null);
             UpdateStatus($"Connection failed: {e.Message}", Color.red);
         }
+    }
+
+    private void ReplaceLatestDeviceData(Dictionary<string, float> data)
+    {
+        latestDeviceData.Clear();
+
+        if (data == null)
+            return;
+
+        foreach (var pair in data)
+            latestDeviceData[pair.Key] = pair.Value;
     }
 
     private IEnumerator StartQrCameraAfterDelay()

@@ -732,6 +732,7 @@ GameObject:
   m_Component:
   - component: {fileID: 588933900}
   - component: {fileID: 588933899}
+  - component: {fileID: 588933901}
   m_Layer: 0
   m_Name: DetectorWorldMarkerManager
   m_TagString: Untagged
@@ -787,10 +788,12 @@ MonoBehaviour:
   smoothPositionOnRescan: 0
   rescanPositionBlend: 0.55
   fixedMarkerSize: 0.2
-  markerAlpha: 0.55
-  showLabel: 1
+  markerAlpha: 0.35
+  showLabel: 0
   showDistanceInLabel: 1
   showAnchorStateInLabel: 1
+  enableArGlassesHud: 1
+  arGlassesHud: {fileID: 588933901}
   labelCameraOffsetMeters: {x: 0.16, y: -0.13, z: -0.01}
   labelWorldScale: 0.04
   labelFontSize: 4.5
@@ -798,6 +801,29 @@ MonoBehaviour:
   labelOutlineColor: {r: 0, g: 0, b: 0, a: 1}
   safeMax: 0.3
   warningMax: 1
+--- !u!114 &588933901
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 588933898}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: eab3dcb5576f4c90a7a213706e27a147, type: 3}
+  m_Name:
+  m_EditorClassIdentifier:
+  markerManager: {fileID: 588933899}
+  radiationReceiver: {fileID: 2005687756}
+  targetCamera: {fileID: 609993946}
+  canvasDistanceMeters: 1.5
+  hudViewportAnchor: {x: 0.94, y: 0.06}
+  hudPixelSize: {x: 720, y: 430}
+  hudFontSize: 27
+  radiationUnit: uSv/h
+  gazeSelectionAngleDegrees: 4
+  screenEdgeMargin: 0.05
+  indicatorFontSize: 28
 --- !u!4 &588933900
 Transform:
   m_ObjectHideFlags: 0

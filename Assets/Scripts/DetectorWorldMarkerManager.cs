@@ -106,11 +106,18 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField] private float fixedMarkerSize = 0.20f;
 
     [Tooltip("Alpha value for transparent detector sphere. 0 = invisible, 1 = opaque.")]
-    [SerializeField, Range(0.05f, 1.0f)] private float markerAlpha = 0.55f;
+    [SerializeField, Range(0.05f, 1.0f)] private float markerAlpha = 0.35f;
 
-    [SerializeField] private bool showLabel = true;
+    [SerializeField] private bool showLabel = false;
     [SerializeField] private bool showDistanceInLabel = true;
     [SerializeField] private bool showAnchorStateInLabel = true;
+
+    [Header("AR Glasses HUD")]
+    [Tooltip("Creates a head-locked server/device HUD and off-screen detector arrows automatically.")]
+    [SerializeField] private bool enableArGlassesHud = true;
+
+    [Tooltip("Optional existing HUD. When empty, one is created automatically at runtime.")]
+    [SerializeField] private ARDetectorHud arGlassesHud;
 
     [Header("Marker Label")]
     [Tooltip("Camera-relative world offset from the sphere center. Positive X is screen-right and negative Y is screen-down.")]
@@ -152,6 +159,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         EnsureCoordinateDatabase();
         EnsureSpatialAnchorManager();
         SubscribeSpatialEvents();
+        EnsureArGlassesHud();
 
         if (loadSavedCoordinatesOnStart)
             LoadSavedCoordinatesWithoutAnchors();
@@ -660,6 +668,20 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         if (!planeManager.enabled)
             planeManager.enabled = true;
+    }
+
+    private void EnsureArGlassesHud()
+    {
+        if (!enableArGlassesHud)
+            return;
+
+        if (arGlassesHud == null)
+            arGlassesHud = GetComponent<ARDetectorHud>();
+
+        if (arGlassesHud == null)
+            arGlassesHud = gameObject.AddComponent<ARDetectorHud>();
+
+        arGlassesHud.Initialize(this, fallbackCamera);
     }
 
     private void EnsureCoordinateDatabase()
@@ -1192,6 +1214,44 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             coordinateDatabase.LogAllCoordinates();
         else
             Debug.LogWarning("[DetectorWorldMarkerManager] No DetectorCoordinateDatabase found.");
+    }
+
+    /// <summary>
+    /// Copies placed detector positions and colors for the head-locked AR HUD.
+    /// The caller owns and reuses the list to avoid per-frame allocations.
+    /// </summary>
+    public void FillHudMarkerStates(List<DetectorHudMarkerState> output)
+    {
+        if (output == null)
+            return;
+
+        output.Clear();
+
+        foreach (var pair in markers)
+        {
+            MarkerInfo marker = pair.Value;
+            if (marker == null || marker.root == null || !marker.isPlaced || !marker.root.activeInHierarchy)
+                continue;
+
+            Color color = GetRiskColor(marker.lastRadiationValue);
+            color.a = 1f;
+
+            output.Add(new DetectorHudMarkerState
+            {
+                detectorId = marker.detectorId,
+                worldPosition = marker.root.transform.position,
+                radiationValue = marker.lastRadiationValue,
+                color = color
+            });
+        }
+    }
+
+    public struct DetectorHudMarkerState
+    {
+        public string detectorId;
+        public Vector3 worldPosition;
+        public float radiationValue;
+        public Color color;
     }
 
     private class MarkerInfo
