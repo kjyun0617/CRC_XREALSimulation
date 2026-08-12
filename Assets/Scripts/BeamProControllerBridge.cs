@@ -22,6 +22,7 @@ public class BeamProControllerBridge : MonoBehaviour
     [SerializeField] private QRScanner qrScanner;
     [SerializeField] private RadiationReceiver radiationReceiver;
 
+    [SerializeField] private XREALCaptureManager captureManager;
     [Header("Controller UI")]
     [Tooltip("Optional Beam Pro-side IP input field. If assigned, ConnectToServer() uses this value.")]
     [SerializeField] private TMP_InputField controllerIpInputField;
@@ -30,9 +31,12 @@ public class BeamProControllerBridge : MonoBehaviour
     [SerializeField] private TMP_Text controllerStatusText;
 
     [Tooltip("Beam Pro-side radiation data text.")]
-    [SerializeField]
-    private TMP_Text controllerRadiationDisplayText;
+    [SerializeField] private TMP_Text controllerRadiationDisplayText;
+    [Tooltip("Beam Pro-side capture status text.")]
+    [SerializeField] private TMP_Text controllerCaptureStatusText;
 
+    [Tooltip("Text child of the Start/Stop Record button.")]
+    [SerializeField] private TMP_Text controllerRecordButtonText;
     [Header("Behavior")]
     [SerializeField] private bool autoFindReferences = true;
     [SerializeField] private bool logActions = true;
@@ -48,6 +52,7 @@ public class BeamProControllerBridge : MonoBehaviour
         ResolveReferences();
         RadiationReceiver.OnServerStatusChanged += HandleServerStatusChanged;
         RadiationReceiver.OnDisplayTextChanged += HandleDisplayTextChanged;
+        XREALCaptureManager.OnCaptureStateChanged += HandleCaptureStateChanged;
         RegisterControllerIpListener();
         SyncControllerIpField();
         SyncCurrentReceiverText();
@@ -58,11 +63,26 @@ public class BeamProControllerBridge : MonoBehaviour
         RadiationReceiver.OnServerStatusChanged -= HandleServerStatusChanged;
 
         RadiationReceiver.OnDisplayTextChanged -= HandleDisplayTextChanged;
-
+        XREALCaptureManager.OnCaptureStateChanged -= HandleCaptureStateChanged;
         if (controllerIpInputField != null)
             controllerIpInputField.onEndEdit.RemoveListener(HandleControllerIpEndEdit);
     }
 
+    private void HandleCaptureStateChanged(
+        string message,
+        bool recording)
+    {
+        if (controllerCaptureStatusText != null)
+            controllerCaptureStatusText.text = message;
+
+        if (controllerRecordButtonText != null)
+        {
+            controllerRecordButtonText.text =
+                recording
+                    ? "Stop Record"
+                    : "Start Record";
+        }
+    }
     /// <summary>
     /// Manually refresh manager references. Useful if objects are created after the controller prefab.
     /// </summary>
@@ -174,6 +194,15 @@ public class BeamProControllerBridge : MonoBehaviour
     public void StartQrScan()
     {
         ResolveReferences();
+
+        if (captureManager != null &&
+            captureManager.IsBusy)
+        {
+            Warn(
+                "Cannot start QR scan while capture camera is busy."
+            );
+            return;
+        }
 
         // The controller prefab has no separate Connect button. Starting a scan
         // must therefore also use the entered/saved IP when no connection exists.
@@ -324,6 +353,11 @@ public class BeamProControllerBridge : MonoBehaviour
 
         if (radiationReceiver == null)
             radiationReceiver = UnityEngine.Object.FindFirstObjectByType<RadiationReceiver>();
+
+        if (captureManager == null)
+        {
+            captureManager = UnityEngine.Object.FindFirstObjectByType<XREALCaptureManager>();
+        }
     }
 
     private void Log(string message)
@@ -337,4 +371,31 @@ public class BeamProControllerBridge : MonoBehaviour
         Debug.LogWarning($"[BeamProControllerBridge] {message}");
     }
 
+    public void ToggleVideoRecording()
+    {
+        ResolveReferences();
+
+        if (captureManager == null)
+        {
+            Warn("XREALCaptureManager not found.");
+            return;
+        }
+
+        captureManager.ToggleVideoRecording();
+        Log("ToggleVideoRecording");
+    }
+
+    public void TakeJpegPhoto()
+    {
+        ResolveReferences();
+
+        if (captureManager == null)
+        {
+            Warn("XREALCaptureManager not found.");
+            return;
+        }
+
+        captureManager.TakeJpegPhoto();
+        Log("TakeJpegPhoto");
+    }
 }

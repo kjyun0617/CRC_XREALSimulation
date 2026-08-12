@@ -488,6 +488,56 @@ CanvasRenderer:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 94489015}
   m_CullTransparentMesh: 1
+--- !u!1 &145385454
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 145385456}
+  - component: {fileID: 145385455}
+  m_Layer: 0
+  m_Name: XREALCaptureManager
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &145385455
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 145385454}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 00801fdf14e5d464598589ad0cd40c61, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  qrScanner: {fileID: 732363537}
+  qrCameraReleaseDelay: 0.25
+  blendMode: 0
+  captureSide: 0
+  audioState: 3
+  backgroundColor: {r: 0, g: 0, b: 0, a: 1}
+--- !u!4 &145385456
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 145385454}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -0.008177512, y: 1.1201034, z: 1.5521616}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &211346756
 GameObject:
   m_ObjectHideFlags: 0
@@ -802,29 +852,6 @@ MonoBehaviour:
   labelOutlineColor: {r: 0, g: 0, b: 0, a: 1}
   safeMax: 0.3
   warningMax: 1
---- !u!114 &588933901
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 588933898}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: eab3dcb5576f4c90a7a213706e27a147, type: 3}
-  m_Name:
-  m_EditorClassIdentifier:
-  markerManager: {fileID: 588933899}
-  radiationReceiver: {fileID: 2005687756}
-  targetCamera: {fileID: 609993946}
-  canvasDistanceMeters: 1.5
-  hudViewportAnchor: {x: 0.94, y: 0.06}
-  hudPixelSize: {x: 720, y: 430}
-  hudFontSize: 27
-  radiationUnit: uSv/h
-  gazeSelectionAngleDegrees: 8
-  screenEdgeMargin: 0.05
-  indicatorFontSize: 28
 --- !u!4 &588933900
 Transform:
   m_ObjectHideFlags: 0
@@ -840,6 +867,29 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &588933901
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 588933898}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: eab3dcb5576f4c90a7a213706e27a147, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  markerManager: {fileID: 588933899}
+  radiationReceiver: {fileID: 2005687756}
+  targetCamera: {fileID: 609993946}
+  canvasDistanceMeters: 1.5
+  hudViewportAnchor: {x: 0.94, y: 0.06}
+  hudPixelSize: {x: 720, y: 430}
+  hudFontSize: 27
+  radiationUnit: uSv/h
+  gazeSelectionAngleDegrees: 8
+  screenEdgeMargin: 0.05
+  indicatorFontSize: 28
 --- !u!20 &609993946 stripped
 Camera:
   m_CorrespondingSourceObject: {fileID: 9011500862288746601, guid: 3182b5074a6bf3d4887a44a38cbb9cb6, type: 3}
@@ -1946,3 +1996,4 @@ SceneRoots:
   - {fileID: 588933900}
   - {fileID: 906282735}
   - {fileID: 1423238746}
+  - {fileID: 145385456}
