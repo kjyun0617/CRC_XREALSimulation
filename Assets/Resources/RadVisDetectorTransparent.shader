@@ -2,12 +2,11 @@ Shader "RadVis/DetectorTransparent"
 {
     Properties
     {
-        _Color ("Detector Line Color", Color) = (0.65, 0.65, 0.65, 0.9)
-        _SurfaceBrightness ("Surface Fill Brightness", Range(0.02, 0.45)) = 0.16
-        _LongitudeLines ("Longitude Lines", Range(4, 24)) = 12
-        _LatitudeLines ("Latitude Lines", Range(2, 12)) = 6
-        _GridLineWidth ("Grid Line Half Width", Range(0.005, 0.08)) = 0.018
-        _RimWidth ("Silhouette Rim Width", Range(0.02, 0.25)) = 0.08
+        _Color ("Detector Contour Color", Color) = (0.65, 0.65, 0.65, 0.9)
+        _SurfaceBrightness ("Surface Fill Brightness", Range(0.02, 0.35)) = 0.12
+        _ContourBands ("Iso-response Contour Bands", Range(2, 6)) = 3
+        _ContourLineWidth ("Contour Line Half Width", Range(0.003, 0.05)) = 0.012
+        _RimWidth ("Silhouette Line Width", Range(0.01, 0.15)) = 0.045
     }
 
     SubShader
@@ -25,7 +24,7 @@ Shader "RadVis/DetectorTransparent"
         ZTest LEqual
         // XREAL optical displays express transparency most reliably through
         // emitted brightness. Keep explicit replacement blending, then draw the
-        // shell dimly and the guide lines brightly in the same detector color.
+        // shell dimly and the measurement contours brightly in the detector color.
         Blend One Zero
 
         Pass
@@ -55,9 +54,8 @@ Shader "RadVis/DetectorTransparent"
 
             fixed4 _Color;
             float _SurfaceBrightness;
-            float _LongitudeLines;
-            float _LatitudeLines;
-            float _GridLineWidth;
+            float _ContourBands;
+            float _ContourLineWidth;
             float _RimWidth;
 
             float PeriodicLineCoverage(float coordinate, float halfWidth)
@@ -89,41 +87,40 @@ Shader "RadVis/DetectorTransparent"
                 float3 normal = normalize(input.worldNormal);
                 float3 viewDirection = normalize(UnityWorldSpaceViewDir(input.worldPosition));
 
-                // Generate the globe in camera space instead of mesh UV space.
-                // A plane anchor may rotate the marker object, but a sphere's
-                // camera-space normal field stays identical to the wearer. This
-                // prevents horizontal/vertical placement from rotating the grid.
-                float3 viewNormal = normalize(mul((float3x3)UNITY_MATRIX_V, normal));
-                float longitudeAngle = atan2(viewNormal.x, viewNormal.z);
-                float latitudeAngle = asin(clamp(viewNormal.y, -1.0, 1.0));
-                float longitudeCoordinate =
-                    longitudeAngle * (_LongitudeLines / (2.0 * UNITY_PI));
-                float latitudeCoordinate =
-                    (latitudeAngle / UNITY_PI + 0.5) * _LatitudeLines;
+                // The response coordinate depends only on N dot V. It is the
+                // projected radial distance from the visible sphere center, so
+                // no object, anchor, plane or world axis can rotate this pattern.
+                float normalFacing = saturate(abs(dot(normal, viewDirection)));
+                float projectedRadius = sqrt(saturate(1.0 - normalFacing * normalFacing));
 
-                float longitudeGrid = PeriodicLineCoverage(
-                    longitudeCoordinate,
-                    _GridLineWidth);
-                float latitudeGrid = PeriodicLineCoverage(
-                    latitudeCoordinate,
-                    _GridLineWidth);
-                float globeGrid = max(longitudeGrid, latitudeGrid);
+                // Draw only the interior integer contours. For N bands their
+                // radii are 1/(N+1) ... N/(N+1); the center and silhouette are
+                // deliberately excluded to avoid a crosshair/target appearance.
+                float contourBands = max(round(_ContourBands), 1.0);
+                float contourCoordinate = projectedRadius * (contourBands + 1.0);
+                float isoResponseContours = PeriodicLineCoverage(
+                    contourCoordinate,
+                    _ContourLineWidth);
+                float contourInteriorMask =
+                    smoothstep(0.55, 0.8, contourCoordinate) *
+                    (1.0 - smoothstep(
+                        contourBands + 0.2,
+                        contourBands + 0.45,
+                        contourCoordinate));
+                isoResponseContours *= contourInteriorMask;
 
-                // Add a camera-facing silhouette ring so the sphere's diameter is
-                // always legible even between sparse grid lines.
-                float normalFacing = abs(dot(normal, viewDirection));
+                // A separate thin silhouette keeps the measured volume legible.
                 float rimAntiAlias = max(fwidth(normalFacing), 0.0001);
                 float silhouette = 1.0 - smoothstep(
                     max(_RimWidth - rimAntiAlias, 0.0),
                     _RimWidth + rimAntiAlias,
                     normalFacing);
 
-                float lineCoverage = saturate(max(globeGrid, silhouette));
+                float lineCoverage = saturate(max(isoResponseContours, silhouette));
 
-                // The whole visible shell uses a subtle fill. A small radial
-                // brightness change gives it volume without introducing any
-                // object- or world-axis cue, while lines stay clearly brighter.
-                float shellShape = lerp(0.72, 1.0, saturate(normalFacing));
+                // The subdued shell provides volume without adding a directional
+                // cue. Contours and silhouette remain precise and brighter.
+                float shellShape = lerp(0.68, 1.0, normalFacing);
                 float surfaceBrightness = saturate(_SurfaceBrightness) * shellShape;
                 float lineBrightness = max(surfaceBrightness, saturate(_Color.a));
                 float brightness = lerp(surfaceBrightness, lineBrightness, lineCoverage);

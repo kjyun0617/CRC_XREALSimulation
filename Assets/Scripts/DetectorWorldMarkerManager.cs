@@ -9,7 +9,7 @@ using UnityEngine.XR.ARSubsystems;
 /// Preview-center detector placement flow.
 /// QR scan selects detectorId, then marker preview follows the glasses/camera center
 /// until PlaceDetector() is called. The placed marker keeps the same fixed size and
-/// updates color by radiation value with a softly filled globe material.
+/// updates color by radiation value with a softly filled response-volume material.
 /// </summary>
 public class DetectorWorldMarkerManager : MonoBehaviour
 {
@@ -116,25 +116,22 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [Tooltip("Fixed world scale of every detector sphere. Radiation value changes color only, not size.")]
     [SerializeField] private float fixedMarkerSize = 0.20f;
 
-    [Tooltip("Brightness of the globe guide lines. The shell uses a separate, dimmer brightness.")]
+    [Tooltip("Brightness of the response contours. The shell uses a separate, dimmer brightness.")]
     [SerializeField, Range(0.25f, 1.0f)] private float markerAlpha = 0.90f;
 
-    [Tooltip("Brightness of the softly colored sphere shell between guide lines.")]
-    [SerializeField, Range(0.02f, 0.45f)] private float globeSurfaceBrightness = 0.16f;
+    [Tooltip("Brightness of the subdued sphere shell between measurement contours.")]
+    [SerializeField, Range(0.02f, 0.35f)] private float responseSurfaceBrightness = 0.12f;
 
-    [Tooltip("Number of longitude guide lines drawn around each detector sphere.")]
-    [SerializeField, Range(4, 24)] private int globeLongitudeLines = 12;
+    [Tooltip("Number of rotation-invariant iso-response contour bands.")]
+    [SerializeField, Range(2, 6)] private int responseContourBands = 3;
 
-    [Tooltip("Number of latitude guide lines drawn around each detector sphere.")]
-    [SerializeField, Range(2, 12)] private int globeLatitudeLines = 6;
+    [Tooltip("Half-width of each projected-radius contour line.")]
+    [SerializeField, Range(0.003f, 0.05f)] private float responseContourLineWidth = 0.012f;
 
-    [Tooltip("Half-width of each globe guide line inside one grid cell.")]
-    [SerializeField, Range(0.005f, 0.08f)] private float globeGridLineWidth = 0.018f;
+    [Tooltip("Width of the thin silhouette line used to read the response-volume diameter.")]
+    [SerializeField, Range(0.01f, 0.15f)] private float responseSilhouetteWidth = 0.045f;
 
-    [Tooltip("Width of the silhouette ring. This keeps the sphere diameter easy to read.")]
-    [SerializeField, Range(0.02f, 0.25f)] private float globeRimWidth = 0.08f;
-
-    [Tooltip("Use the included RadVis softly filled globe shader for consistent XREAL rendering.")]
+    [Tooltip("Use the included RadVis response-contour shader for consistent XREAL rendering.")]
     [SerializeField] private bool forceDedicatedTransparentShader = true;
 
     [SerializeField] private bool showLabel = false;
@@ -1604,19 +1601,16 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             material.SetColor("_Color", color);
 
         if (material.HasProperty("_SurfaceBrightness"))
-            material.SetFloat("_SurfaceBrightness", globeSurfaceBrightness);
+            material.SetFloat("_SurfaceBrightness", responseSurfaceBrightness);
 
-        if (material.HasProperty("_LongitudeLines"))
-            material.SetFloat("_LongitudeLines", globeLongitudeLines);
+        if (material.HasProperty("_ContourBands"))
+            material.SetFloat("_ContourBands", responseContourBands);
 
-        if (material.HasProperty("_LatitudeLines"))
-            material.SetFloat("_LatitudeLines", globeLatitudeLines);
-
-        if (material.HasProperty("_GridLineWidth"))
-            material.SetFloat("_GridLineWidth", globeGridLineWidth);
+        if (material.HasProperty("_ContourLineWidth"))
+            material.SetFloat("_ContourLineWidth", responseContourLineWidth);
 
         if (material.HasProperty("_RimWidth"))
-            material.SetFloat("_RimWidth", globeRimWidth);
+            material.SetFloat("_RimWidth", responseSilhouetteWidth);
     }
 
     private void ConfigureTransparentMaterial(Material material)

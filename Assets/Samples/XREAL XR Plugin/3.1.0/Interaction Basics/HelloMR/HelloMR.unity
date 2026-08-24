@@ -843,11 +843,10 @@ MonoBehaviour:
   rescanPositionBlend: 0.55
   fixedMarkerSize: 0.2
   markerAlpha: 0.9
-  globeSurfaceBrightness: 0.16
-  globeLongitudeLines: 12
-  globeLatitudeLines: 6
-  globeGridLineWidth: 0.018
-  globeRimWidth: 0.08
+  responseSurfaceBrightness: 0.12
+  responseContourBands: 3
+  responseContourLineWidth: 0.012
+  responseSilhouetteWidth: 0.045
   forceDedicatedTransparentShader: 1
   showLabel: 0
   showDistanceInLabel: 1
