@@ -9,7 +9,7 @@ using UnityEngine.XR.ARSubsystems;
 /// Preview-center detector placement flow.
 /// QR scan selects detectorId, then marker preview follows the glasses/camera center
 /// until PlaceDetector() is called. The placed marker keeps the same fixed size and
-/// updates color by radiation value with a see-through globe-line material.
+/// updates color by radiation value with a softly filled globe material.
 /// </summary>
 public class DetectorWorldMarkerManager : MonoBehaviour
 {
@@ -55,6 +55,16 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField] private DetectorSpatialAnchorManager spatialAnchorManager;
     [SerializeField] private bool createSpatialAnchorOnQr = false;
     [SerializeField] private bool parentMarkerToAnchor = true;
+
+    [Header("Server Visibility")]
+    [Tooltip("Keep every restored and placed detector hidden until the WebSocket server is connected.")]
+    [SerializeField] private bool hideMarkersUntilServerConnected = true;
+
+    [Tooltip("Optional. Found automatically when empty.")]
+    [SerializeField] private RadiationReceiver radiationReceiver;
+
+    [Tooltip("With multiple placed detectors, Cancel removes only the marker closest to the gaze center within this angle.")]
+    [SerializeField, Range(1f, 45f)] private float cancelSelectionMaxAngleDegrees = 12f;
 
     [Header("Preview-Center Placement")]
     [Tooltip("ON = use camera/glasses center. OFF = use ZXing QR image center.")]
@@ -106,8 +116,11 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [Tooltip("Fixed world scale of every detector sphere. Radiation value changes color only, not size.")]
     [SerializeField] private float fixedMarkerSize = 0.20f;
 
-    [Tooltip("Brightness of the globe guide lines. The area between lines remains fully see-through.")]
+    [Tooltip("Brightness of the globe guide lines. The shell uses a separate, dimmer brightness.")]
     [SerializeField, Range(0.25f, 1.0f)] private float markerAlpha = 0.90f;
+
+    [Tooltip("Brightness of the softly colored sphere shell between guide lines.")]
+    [SerializeField, Range(0.02f, 0.45f)] private float globeSurfaceBrightness = 0.16f;
 
     [Tooltip("Number of longitude guide lines drawn around each detector sphere.")]
     [SerializeField, Range(4, 24)] private int globeLongitudeLines = 12;
@@ -116,12 +129,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField, Range(2, 12)] private int globeLatitudeLines = 6;
 
     [Tooltip("Half-width of each globe guide line inside one grid cell.")]
-    [SerializeField, Range(0.01f, 0.12f)] private float globeGridLineWidth = 0.04f;
+    [SerializeField, Range(0.005f, 0.08f)] private float globeGridLineWidth = 0.018f;
 
     [Tooltip("Width of the silhouette ring. This keeps the sphere diameter easy to read.")]
-    [SerializeField, Range(0.05f, 0.35f)] private float globeRimWidth = 0.18f;
+    [SerializeField, Range(0.02f, 0.25f)] private float globeRimWidth = 0.08f;
 
-    [Tooltip("Use the included RadVis globe-line shader so XREAL builds cannot fall back to an opaque filled material.")]
+    [Tooltip("Use the included RadVis softly filled globe shader for consistent XREAL rendering.")]
     [SerializeField] private bool forceDedicatedTransparentShader = true;
 
     [SerializeField] private bool showLabel = false;
@@ -162,12 +175,14 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     // that exact sphere immediately after it has been placed.
     private string lastInteractedDetectorId = "";
     private Shader cachedDetectorTransparentShader;
+    private bool serverConnected;
 
     private void OnEnable()
     {
         QRScanner.OnScanStarted += NotifyQrScanStarted;
         QRScanner.OnQRDetectedDetailed += HandleQrDetected;
         RadiationReceiver.OnRadiationDataReceived += HandleRadiationDataReceived;
+        RadiationReceiver.OnServerConnectionChanged += HandleServerConnectionChanged;
         EnsureSpatialAnchorManager();
         SubscribeSpatialEvents();
     }
@@ -177,6 +192,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         QRScanner.OnScanStarted -= NotifyQrScanStarted;
         QRScanner.OnQRDetectedDetailed -= HandleQrDetected;
         RadiationReceiver.OnRadiationDataReceived -= HandleRadiationDataReceived;
+        RadiationReceiver.OnServerConnectionChanged -= HandleServerConnectionChanged;
         UnsubscribeSpatialEvents();
     }
 
@@ -196,8 +212,11 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         EnsurePlaneDetectionManager();
         EnsureCoordinateDatabase();
         EnsureSpatialAnchorManager();
+        EnsureRadiationReceiver();
         SubscribeSpatialEvents();
         EnsureArGlassesHud();
+
+        SetServerConnectionState(radiationReceiver != null && radiationReceiver.IsConnected);
 
         if (loadSavedCoordinatesOnStart)
             LoadSavedCoordinatesWithoutAnchors();
@@ -282,10 +301,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
             if (marker.root != null)
             {
-                marker.root.SetActive(true);
-
-                if (marker.renderer != null)
-                    marker.renderer.enabled = true;
+                SetMarkerRequestedVisibility(marker, true);
             }
 
             UpdateMarkerVisual(marker, marker.lastRadiationValue);
@@ -386,8 +402,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         session.localPosition = marker.root.transform.localPosition;
         session.localRotation = marker.root.transform.localRotation;
         session.localScale = marker.root.transform.localScale;
-        session.rootWasActive = marker.root.activeSelf;
-        session.rendererWasEnabled = marker.renderer == null || marker.renderer.enabled;
+        session.visibilityRequested = marker.visibilityRequested;
         session.savedPosition = marker.savedPosition;
         session.lastEstimatedDistance = marker.lastEstimatedDistance;
         session.lastQrPixelSize = marker.lastQrPixelSize;
@@ -470,9 +485,8 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             }
 
             marker.root.transform.localScale = session.localScale;
-            marker.root.SetActive(session.rootWasActive);
-            if (marker.renderer != null)
-                marker.renderer.enabled = session.rendererWasEnabled;
+            marker.visibilityRequested = session.visibilityRequested;
+            ApplyMarkerVisibility(marker);
 
             UpdateLabel(marker, marker.lastRadiationValue, false);
             return true;
@@ -484,7 +498,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         if (marker.root != null)
         {
-            marker.root.SetActive(false);
+            SetMarkerRequestedVisibility(marker, false);
             Destroy(marker.root);
         }
 
@@ -532,13 +546,10 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         Vector3 worldPosition = placementOrigin.position + direction * distance;
         worldPosition += placementOrigin.up * markerVerticalOffsetMeters;
 
-        marker.root.SetActive(true);
+        SetMarkerRequestedVisibility(marker, true);
         marker.root.transform.position = worldPosition;
         marker.root.transform.rotation = Quaternion.LookRotation(direction, placementOrigin.up);
         marker.root.transform.localScale = Vector3.one * fixedMarkerSize;
-
-        if (marker.renderer != null)
-            marker.renderer.enabled = true;
 
         marker.savedPosition = worldPosition;
         marker.lastEstimatedDistance = distance;
@@ -554,19 +565,16 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             marker.anchorState = waitingForPlaneStateLabel;
 
             if (hidePreviewWithoutPlaneHit && marker.root != null)
-                marker.root.SetActive(false);
+                SetMarkerRequestedVisibility(marker, false);
 
             return;
         }
 
         marker.hasValidPlaneHit = true;
-        marker.root.SetActive(true);
+        SetMarkerRequestedVisibility(marker, true);
         marker.root.transform.position = hitPosition;
         marker.root.transform.rotation = hitRotation;
         marker.root.transform.localScale = Vector3.one * fixedMarkerSize;
-
-        if (marker.renderer != null)
-            marker.renderer.enabled = true;
 
         marker.savedPosition = hitPosition;
         marker.lastEstimatedDistance = hitDistance;
@@ -807,9 +815,11 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         if (string.IsNullOrEmpty(detectorId))
         {
-            Debug.LogWarning("[DetectorWorldMarkerManager] Cancel called, but there is no current or recently placed detector.");
-            resultMessage = "Nothing to cancel";
-            return false;
+            if (!TrySelectPlacedDetectorForCancel(out detectorId, out resultMessage))
+            {
+                Debug.LogWarning($"[DetectorWorldMarkerManager] Cancel did not select a detector. {resultMessage}");
+                return false;
+            }
         }
 
         if (RemoveDetectorAndSavedData(detectorId))
@@ -820,6 +830,93 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         resultMessage = $"Detector not found: {detectorId}";
         return false;
+    }
+
+    private bool TrySelectPlacedDetectorForCancel(
+        out string detectorId,
+        out string resultMessage)
+    {
+        detectorId = "";
+        resultMessage = "Nothing to cancel";
+
+        int placedCount = 0;
+        MarkerInfo onlyMarker = null;
+
+        foreach (var pair in markers)
+        {
+            MarkerInfo marker = pair.Value;
+            if (marker == null || marker.root == null || !marker.isPlaced)
+                continue;
+
+            placedCount++;
+            onlyMarker = marker;
+        }
+
+        if (placedCount == 0)
+            return false;
+
+        // This fixes the restored-single-marker case: after an app restart there
+        // is deliberately no "last interacted" token, but Cancel is unambiguous.
+        if (placedCount == 1)
+        {
+            detectorId = onlyMarker.detectorId;
+            return true;
+        }
+
+        if (hideMarkersUntilServerConnected && !serverConnected)
+        {
+            resultMessage = "Connect to the server, then aim at the detector to remove";
+            return false;
+        }
+
+        EnsurePlacementOrigin();
+        if (placementOrigin == null)
+        {
+            resultMessage = "Cannot select a detector: glasses pose is unavailable";
+            return false;
+        }
+
+        Vector3 gazeForward = placementOrigin.forward;
+        if (gazeForward.sqrMagnitude < 0.0001f)
+        {
+            resultMessage = "Cannot select a detector: glasses direction is unavailable";
+            return false;
+        }
+
+        gazeForward.Normalize();
+        float closestAngle = float.PositiveInfinity;
+        float closestDistance = float.PositiveInfinity;
+        MarkerInfo selected = null;
+
+        foreach (var pair in markers)
+        {
+            MarkerInfo marker = pair.Value;
+            if (marker == null || marker.root == null || !marker.isPlaced)
+                continue;
+
+            Vector3 toMarker = marker.root.transform.position - placementOrigin.position;
+            float distance = toMarker.magnitude;
+            if (distance < 0.0001f)
+                continue;
+
+            float angle = Vector3.Angle(gazeForward, toMarker / distance);
+            if (angle < closestAngle ||
+                (Mathf.Approximately(angle, closestAngle) && distance < closestDistance))
+            {
+                closestAngle = angle;
+                closestDistance = distance;
+                selected = marker;
+            }
+        }
+
+        if (selected == null || closestAngle > Mathf.Max(1f, cancelSelectionMaxAngleDegrees))
+        {
+            resultMessage = "Aim at the detector to remove, then press Cancel again";
+            return false;
+        }
+
+        detectorId = selected.detectorId;
+        return true;
     }
 
     private bool RemoveDetectorAndSavedData(string detectorId)
@@ -839,7 +936,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         markers.Remove(detectorId);
 
         if (marker.root != null)
-            marker.root.SetActive(false);
+            SetMarkerRequestedVisibility(marker, false);
 
         // Erase the persistent anchor before removing the coordinate record,
         // because the anchor manager reads its saved GUID from that record.
@@ -997,6 +1094,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         }
     }
 
+    private void EnsureRadiationReceiver()
+    {
+        if (radiationReceiver == null)
+            radiationReceiver = FindFirstObjectByType<RadiationReceiver>();
+    }
+
     private void EnsureSpatialAnchorManager()
     {
         if (!useSpatialAnchors)
@@ -1056,20 +1159,18 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (!useSpatialAnchors || marker == null)
             return;
 
-        // The newly committed coordinate is authoritative. Detach first, then remove
-        // the previous binding (and invalidate any pending save/load) so a failed new
-        // save cannot make the detector jump back to its old anchor after restart.
+        // Detach the marker while the replacement anchor is being created. The
+        // spatial manager keeps the previous persisted anchor until the new save
+        // succeeds, so a transient mapping failure cannot destroy the last known
+        // physical-space restoration point.
         if (marker.root != null)
             marker.root.transform.SetParent(transform, true);
 
         EnsureSpatialAnchorManager();
         if (spatialAnchorManager != null)
-            spatialAnchorManager.EraseAnchorForDetector(detectorId);
-        else if (coordinateDatabase != null)
-            coordinateDatabase.ClearAnchorGuid(detectorId);
+            spatialAnchorManager.InvalidatePendingOperationForDetector(detectorId);
 
         marker.anchor = null;
-        marker.anchorGuid = "";
 
         if (createSpatialAnchorOnQr &&
             CreateAnchorForMarker(detectorId, worldPosition, worldRotation))
@@ -1078,7 +1179,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         }
         else
         {
-            marker.anchorState = $"{placedStateLabel} (coordinate)";
+            marker.anchorState = $"{placedStateLabel} (anchor unavailable)";
         }
     }
 
@@ -1159,37 +1260,41 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (IsActivePlacementForDetector(detectorId))
             return;
 
-        if (coordinateDatabase != null && coordinateDatabase.TryGetRecord(detectorId, out DetectorCoordinateRecord record))
-        {
-            MarkerInfo marker = CreateOrMoveMarker(
-                record.detectorId,
-                record.GetPosition(),
-                record.estimatedDistanceMeters,
-                record.qrPixelSize,
-                null,
-                true);
-            if (marker != null)
-            {
-                marker.savedPosition = record.GetPosition();
-                marker.isFollowingPlacementOrigin = false;
-                marker.isPlaced = true;
-                marker.anchor = null;
-                marker.anchorGuid = "";
-                marker.anchorState = "anchor load failed; fallback coord";
-                if (record.lastRadiationValue >= 0f)
-                    UpdateMarkerVisual(marker, record.lastRadiationValue);
-                else
-                    UpdateMarkerVisual(marker, marker.lastRadiationValue);
-            }
-        }
-
-        Debug.LogWarning($"[DetectorWorldMarkerManager] Anchor load failed for {detectorId}: {message}");
+        // A serialized Unity world pose is session-relative and is not the same
+        // physical location after an app restart. Do not show that coordinate as a
+        // fallback; it creates the startup "ghost" sphere and can visibly jump once
+        // relocalization completes.
+        Debug.LogWarning(
+            $"[DetectorWorldMarkerManager] Anchor load failed for {detectorId}; " +
+            $"the detector stays hidden until it is placed again. {message}");
     }
 
     private bool IsActivePlacementForDetector(string detectorId)
     {
         return activePlacementSession != null &&
                DetectorIdsEqual(activePlacementSession.detectorId, detectorId);
+    }
+
+    private void HandleServerConnectionChanged(bool connected)
+    {
+        SetServerConnectionState(connected);
+    }
+
+    private void SetServerConnectionState(bool connected)
+    {
+        bool changed = serverConnected != connected;
+        serverConnected = connected;
+
+        foreach (var pair in markers)
+            ApplyMarkerVisibility(pair.Value);
+
+        if (changed)
+        {
+            Debug.Log(
+                connected
+                    ? "[DetectorWorldMarkerManager] Server connected; detector markers may now be shown."
+                    : "[DetectorWorldMarkerManager] Server disconnected; all detector markers are hidden.");
+        }
     }
 
     private void HandleRadiationDataReceived(Dictionary<string, float> data)
@@ -1412,7 +1517,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             !marker.hasValidPlaneHit;
 
         if (waitingForPlaneHit && hidePreviewWithoutPlaneHit)
-            marker.root.SetActive(false);
+            SetMarkerRequestedVisibility(marker, false);
         else
             ForceMarkerVisible(marker);
 
@@ -1446,14 +1551,34 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (marker == null)
             return;
 
+        SetMarkerRequestedVisibility(marker, true);
+    }
+
+    private void SetMarkerRequestedVisibility(MarkerInfo marker, bool visible)
+    {
+        if (marker == null)
+            return;
+
+        marker.visibilityRequested = visible;
+        ApplyMarkerVisibility(marker);
+    }
+
+    private void ApplyMarkerVisibility(MarkerInfo marker)
+    {
+        if (marker == null)
+            return;
+
+        bool visible = marker.visibilityRequested &&
+                       (!hideMarkersUntilServerConnected || serverConnected);
+
         if (marker.root != null)
-            marker.root.SetActive(true);
+            marker.root.SetActive(visible);
 
         if (marker.renderer != null)
-            marker.renderer.enabled = true;
+            marker.renderer.enabled = visible;
 
         if (showLabel && marker.label != null)
-            marker.label.gameObject.SetActive(true);
+            marker.label.gameObject.SetActive(visible);
     }
 
     private void SetRendererTransparentColor(Renderer renderer, Color color)
@@ -1477,6 +1602,9 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         if (material.HasProperty("_Color"))
             material.SetColor("_Color", color);
+
+        if (material.HasProperty("_SurfaceBrightness"))
+            material.SetFloat("_SurfaceBrightness", globeSurfaceBrightness);
 
         if (material.HasProperty("_LongitudeLines"))
             material.SetFloat("_LongitudeLines", globeLongitudeLines);
@@ -1589,6 +1717,35 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (useCoordinateDatabase && coordinateDatabase != null)
         {
             IReadOnlyList<DetectorCoordinateRecord> records = coordinateDatabase.GetAllRecords();
+
+            if (useSpatialAnchors)
+            {
+                int legacyCoordinateCount = 0;
+                for (int i = 0; i < records.Count; i++)
+                {
+                    DetectorCoordinateRecord record = records[i];
+                    if (record != null &&
+                        !string.IsNullOrWhiteSpace(record.detectorId) &&
+                        !record.HasSavedAnchor())
+                    {
+                        legacyCoordinateCount++;
+                    }
+                }
+
+                if (legacyCoordinateCount > 0)
+                {
+                    Debug.LogWarning(
+                        $"[DetectorWorldMarkerManager] {legacyCoordinateCount} saved detector coordinate(s) " +
+                        "have no persistent spatial anchor and will not be restored at a misleading session-space pose. " +
+                        "Scan and place them once to create anchors.");
+                }
+
+                // Records with GUIDs are materialized only by HandleAnchorLoaded.
+                // This avoids a coordinate-fallback blink or jump before XREAL
+                // finishes relocalizing the persisted local anchor.
+                return;
+            }
+
             for (int i = 0; i < records.Count; i++)
             {
                 DetectorCoordinateRecord record = records[i];
@@ -1599,9 +1756,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
                 if (marker != null)
                 {
-                    marker.anchorState = useSpatialAnchors && record.HasSavedAnchor()
-                        ? "anchor loading; fallback coord"
-                        : (useSpatialAnchors ? "fallback coord" : record.placementMethod);
+                    marker.anchorState = record.placementMethod;
                     marker.isFollowingPlacementOrigin = false;
                     marker.isPlaced = true;
 
@@ -1618,7 +1773,22 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     public void ClearSavedMarkers()
     {
-        List<string> detectorIds = new List<string>(markers.Keys);
+        HashSet<string> detectorIds =
+            new HashSet<string>(markers.Keys, StringComparer.OrdinalIgnoreCase);
+
+        // Include records whose anchors are still loading or failed to relocalize;
+        // those IDs intentionally have no visible marker but their native XREAL map
+        // files still need to be erased by a clear-all action.
+        if (coordinateDatabase != null)
+        {
+            IReadOnlyList<DetectorCoordinateRecord> records = coordinateDatabase.GetAllRecords();
+            for (int i = 0; i < records.Count; i++)
+            {
+                DetectorCoordinateRecord record = records[i];
+                if (record != null && !string.IsNullOrWhiteSpace(record.detectorId))
+                    detectorIds.Add(record.detectorId.Trim());
+            }
+        }
 
         foreach (string detectorId in detectorIds)
         {
@@ -1711,8 +1881,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         public Vector3 localPosition;
         public Quaternion localRotation;
         public Vector3 localScale;
-        public bool rootWasActive;
-        public bool rendererWasEnabled;
+        public bool visibilityRequested;
         public Vector3 savedPosition;
         public float lastEstimatedDistance;
         public float lastQrPixelSize;
@@ -1741,6 +1910,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         public bool isFollowingPlacementOrigin;
         public bool isPlaced;
         public bool hasValidPlaneHit;
+        public bool visibilityRequested;
         public ARAnchor anchor;
         public string anchorGuid;
         public string anchorState;

@@ -30,6 +30,13 @@ public class RadiationReceiver : MonoBehaviour
     public delegate void ServerStatusChangedSignature(string message, Color color);
     public static event ServerStatusChangedSignature OnServerStatusChanged;
 
+    /// <summary>
+    /// Raised on Unity's main thread whenever the usable server connection changes.
+    /// False is also published while connecting so marker/UI consumers can hide
+    /// stale server-backed content immediately.
+    /// </summary>
+    public static event Action<bool> OnServerConnectionChanged;
+
     [Header("UI")]
     [SerializeField] private TMP_Text displayText;
     [SerializeField] private TMP_InputField ipInputField;
@@ -40,6 +47,14 @@ public class RadiationReceiver : MonoBehaviour
     [SerializeField] private string defaultIp = "192.168.0.60";
     [SerializeField] private int serverPort = 5002;
 
+    [Header("Saved Server Reconnection")]
+    [SerializeField] private bool autoReconnectSavedServer = true;
+    [SerializeField, Min(0f)] private float automaticReconnectStartDelay = 0.35f;
+    [SerializeField, Min(0.25f)] private float automaticReconnectInitialRetryDelay = 2f;
+    [SerializeField, Min(0.25f)] private float automaticReconnectMaxRetryDelay = 15f;
+    [SerializeField, Min(1f)] private float connectionAttemptTimeout = 10f;
+    [SerializeField] private bool reconnectWhenApplicationResumes = true;
+
     [Header("Keyboard On Start")]
     [SerializeField] private bool openKeyboardOnStart = true;
     [SerializeField] private float keyboardOpenDelay = 0.5f;
@@ -47,22 +62,34 @@ public class RadiationReceiver : MonoBehaviour
 
     [Header("QR Scan After Connect")]
     [SerializeField] private QRScanner qrScanner;
+    [Tooltip("Applies to explicit/manual connections. Restoring a saved server never starts QR scanning.")]
     [SerializeField] private bool startQrCameraAfterConnect = true;
     [SerializeField] private float qrStartDelayAfterConnect = 0.3f;
 
     private WebSocket websocket;
     private Coroutine qrStartCoroutine;
+    private Coroutine automaticReconnectCoroutine;
+    private Coroutine connectionAttemptTimeoutCoroutine;
     private int automaticQrStartGeneration;
+    private volatile int connectionAttemptGeneration;
+    private int automaticReconnectGeneration;
     private bool automaticQrStartExpected;
     private string savedIp;
+    private string activeServerIp;
+    private bool hasSavedServerIp;
     private bool isConnecting;
+    private bool isServerConnected;
+    private bool hasStarted;
+    private volatile bool isShuttingDown;
+    private float nextAutomaticReconnectDelay;
     private string currentStatusMessage = "";
     private Color currentStatusColor = Color.white;
 
     public string CurrentStatusMessage => currentStatusMessage;
     public Color CurrentStatusColor => currentStatusColor;
     public string CurrentServerIp => string.IsNullOrWhiteSpace(savedIp) ? defaultIp : savedIp;
-    public bool IsConnected => websocket != null && websocket.State == WebSocketState.Open;
+    public bool HasSavedServerIp => hasSavedServerIp;
+    public bool IsConnected => isServerConnected;
     public bool IsConnecting => isConnecting;
     public bool IsQrScanPending => automaticQrStartExpected || qrStartCoroutine != null;
 
@@ -72,9 +99,22 @@ public class RadiationReceiver : MonoBehaviour
 
     private void Awake()
     {
+        // NativeWebSocket callbacks can arrive away from Unity's thread. Create
+        // the dispatcher GameObject here so callbacks never construct Unity
+        // objects while merely trying to enqueue a main-thread state change.
+        _ = UnityMainThreadDispatcher.Instance;
+
         // Load this in Awake so controller prefabs created during scene startup can
         // immediately copy the saved IP before this component's Start runs.
-        savedIp = PlayerPrefs.GetString(ServerIpPlayerPrefsKey, defaultIp);
+        string persistedIp = PlayerPrefs.GetString(ServerIpPlayerPrefsKey, "");
+        savedIp = CleanIp(persistedIp);
+        hasSavedServerIp = PlayerPrefs.HasKey(ServerIpPlayerPrefsKey) &&
+                           !string.IsNullOrWhiteSpace(savedIp);
+
+        if (!hasSavedServerIp)
+            savedIp = CleanIp(defaultIp);
+
+        ResetAutomaticReconnectDelay();
     }
 
     private void Start()
@@ -93,8 +133,12 @@ public class RadiationReceiver : MonoBehaviour
 
         UpdateDisplay(WaitingForDataMessage);
         UpdateStatus("Disconnected", Color.red);
+        PublishServerConnection(false, true);
+        hasStarted = true;
 
-        if (openKeyboardOnStart)
+        if (autoReconnectSavedServer && hasSavedServerIp)
+            ScheduleAutomaticReconnect(automaticReconnectStartDelay);
+        else if (openKeyboardOnStart)
             StartCoroutine(OpenKeyboardAfterDelay());
     }
 
@@ -182,7 +226,7 @@ public class RadiationReceiver : MonoBehaviour
         }
 
         SaveIp(ip);
-        Connect(ip);
+        Connect(ip, true, false);
     }
 
     private void SaveIp(string ip)
@@ -191,6 +235,11 @@ public class RadiationReceiver : MonoBehaviour
         if (string.IsNullOrEmpty(ip)) return;
 
         savedIp = ip;
+        hasSavedServerIp = true;
+
+        if (ipInputField != null)
+            ipInputField.SetTextWithoutNotify(savedIp);
+
         PlayerPrefs.SetString(ServerIpPlayerPrefsKey, savedIp);
         PlayerPrefs.Save();
     }
@@ -213,45 +262,95 @@ public class RadiationReceiver : MonoBehaviour
         return ip.Trim();
     }
 
-    private async void Connect(string ip)
+    private async void Connect(
+        string ip,
+        bool allowAutomaticQrStart,
+        bool isAutomaticReconnect)
     {
-        if (isConnecting)
-            return;
-
         string cleanIp = CleanIp(ip);
         if (string.IsNullOrEmpty(cleanIp))
         {
             UpdateStatus("IP is empty", Color.red);
+            PublishServerConnection(false, true);
             return;
         }
+
+        if (isAutomaticReconnect && (isConnecting || IsConnected))
+            return;
 
         string url = $"ws://{cleanIp}:{serverPort}";
         Debug.Log($"Trying connecting to URL: {url}");
 
+        CancelScheduledAutomaticReconnect();
+        CancelConnectionAttemptTimeout();
+        if (!isAutomaticReconnect)
+            ResetAutomaticReconnectDelay();
+
+        int connectionGeneration = ++connectionAttemptGeneration;
         isConnecting = true;
+        activeServerIp = cleanIp;
+        PublishServerConnection(false, true);
 
         CancelPendingQrScan();
         int qrStartGeneration = automaticQrStartGeneration;
-        automaticQrStartExpected = startQrCameraAfterConnect;
+        automaticQrStartExpected =
+            allowAutomaticQrStart && startQrCameraAfterConnect;
 
-        if (websocket != null && websocket.State == WebSocketState.Open)
-            await websocket.Close();
+        WebSocket previousWebsocket = websocket;
+        websocket = null;
+        CancelOrCloseSupersededConnection(previousWebsocket);
+
+        if (isShuttingDown || connectionGeneration != connectionAttemptGeneration)
+            return;
 
         ReplaceLatestDeviceData(null);
         UpdateStatus($"Connecting to... {url}", Color.yellow);
 
-        websocket = new WebSocket(url);
+        WebSocket connection;
 
-        websocket.OnOpen += () =>
+        try
+        {
+            connection = new WebSocket(url);
+        }
+        catch (Exception creationException)
+        {
+            isConnecting = false;
+            CancelAutomaticQrStartIfCurrent(qrStartGeneration);
+            ReplaceLatestDeviceData(null);
+            UpdateDisplay(WaitingForDataMessage);
+            UpdateStatus($"Invalid server address: {creationException.Message}", Color.red);
+            PublishServerConnection(false, true);
+            ScheduleNextAutomaticReconnect();
+            return;
+        }
+
+        websocket = connection;
+        connectionAttemptTimeoutCoroutine = StartCoroutine(
+            CancelConnectionAttemptAfterTimeout(
+                connectionGeneration,
+                connection,
+                Mathf.Max(1f, connectionAttemptTimeout)));
+
+        connection.OnOpen += () =>
         {
             Debug.Log("Server connected!");
-            isConnecting = false;
+
+            if (!IsConnectionAttemptCurrentBeforeDispatch(connectionGeneration))
+                return;
 
             UnityMainThreadDispatcher.Enqueue(() =>
             {
+                if (!IsCurrentConnectionAttempt(connectionGeneration, connection))
+                    return;
+
+                CancelConnectionAttemptTimeout();
+                isConnecting = false;
+                ResetAutomaticReconnectDelay();
+                CancelScheduledAutomaticReconnect();
                 ReplaceLatestDeviceData(null);
                 UpdateDisplay(WaitingForDataMessage);
                 UpdateStatus($"Connected: {cleanIp}", Color.green);
+                PublishServerConnection(true, true);
 
                 if (qrStartGeneration == automaticQrStartGeneration)
                 {
@@ -273,8 +372,11 @@ public class RadiationReceiver : MonoBehaviour
             });
         };
 
-        websocket.OnMessage += (bytes) =>
+        connection.OnMessage += (bytes) =>
         {
+            if (!IsConnectionAttemptCurrentBeforeDispatch(connectionGeneration))
+                return;
+
             string json = System.Text.Encoding.UTF8.GetString(bytes);
             Debug.Log($"Received data: {json}");
 
@@ -290,6 +392,10 @@ public class RadiationReceiver : MonoBehaviour
 
                 UnityMainThreadDispatcher.Enqueue(() =>
                 {
+                    if (!IsCurrentConnectionAttempt(connectionGeneration, connection) ||
+                        !IsConnected)
+                        return;
+
                     ReplaceLatestDeviceData(normalizedData);
                     UpdateDisplay(result);
                     OnRadiationDataReceived?.Invoke(
@@ -302,44 +408,251 @@ public class RadiationReceiver : MonoBehaviour
             }
         };
 
-        websocket.OnError += (e) =>
+        connection.OnError += (e) =>
         {
             Debug.LogError($"Error: {e}");
-            isConnecting = false;
+
+            if (!IsConnectionAttemptCurrentBeforeDispatch(connectionGeneration))
+                return;
+
             UnityMainThreadDispatcher.Enqueue(() =>
             {
+                if (!IsCurrentConnectionAttempt(connectionGeneration, connection))
+                    return;
+
+                CancelConnectionAttemptTimeout();
+                isConnecting = false;
                 CancelAutomaticQrStartIfCurrent(qrStartGeneration);
                 ReplaceLatestDeviceData(null);
                 UpdateDisplay(WaitingForDataMessage);
                 UpdateStatus($"Error: {e}", Color.red);
+                PublishServerConnection(false, true);
+                ScheduleNextAutomaticReconnect();
             });
         };
 
-        websocket.OnClose += (e) =>
+        connection.OnClose += (e) =>
         {
             Debug.Log("Disconnected");
-            isConnecting = false;
+
+            if (!IsConnectionAttemptCurrentBeforeDispatch(connectionGeneration))
+                return;
+
             UnityMainThreadDispatcher.Enqueue(() =>
             {
+                if (!IsCurrentConnectionAttempt(connectionGeneration, connection))
+                    return;
+
+                CancelConnectionAttemptTimeout();
+                isConnecting = false;
                 CancelAutomaticQrStartIfCurrent(qrStartGeneration);
                 ReplaceLatestDeviceData(null);
                 UpdateDisplay(WaitingForDataMessage);
                 UpdateStatus("Disconnected", Color.red);
+                PublishServerConnection(false, true);
+                ScheduleNextAutomaticReconnect();
             });
         };
 
         try
         {
-            await websocket.Connect();
+            await connection.Connect();
         }
-        catch (System.Exception e)
+        catch (Exception e)
         {
-            isConnecting = false;
             Debug.LogError($"WebSocket connection failed: {e.Message}");
-            CancelAutomaticQrStartIfCurrent(qrStartGeneration);
-            ReplaceLatestDeviceData(null);
-            UpdateDisplay(WaitingForDataMessage);
-            UpdateStatus($"Connection failed: {e.Message}", Color.red);
+
+            if (!IsConnectionAttemptCurrentBeforeDispatch(connectionGeneration))
+                return;
+
+            UnityMainThreadDispatcher.Enqueue(() =>
+            {
+                if (!IsCurrentConnectionAttempt(connectionGeneration, connection))
+                    return;
+
+                CancelConnectionAttemptTimeout();
+                isConnecting = false;
+                CancelAutomaticQrStartIfCurrent(qrStartGeneration);
+                ReplaceLatestDeviceData(null);
+                UpdateDisplay(WaitingForDataMessage);
+                UpdateStatus($"Connection failed: {e.Message}", Color.red);
+                PublishServerConnection(false, true);
+                ScheduleNextAutomaticReconnect();
+            });
+        }
+    }
+
+    private bool IsCurrentConnectionAttempt(int generation, WebSocket connection)
+    {
+        return !isShuttingDown &&
+               generation == connectionAttemptGeneration &&
+               ReferenceEquals(websocket, connection);
+    }
+
+    private bool IsConnectionAttemptCurrentBeforeDispatch(int generation)
+    {
+        return !isShuttingDown && generation == connectionAttemptGeneration;
+    }
+
+    private IEnumerator CancelConnectionAttemptAfterTimeout(
+        int generation,
+        WebSocket connection,
+        float timeout)
+    {
+        yield return new WaitForSecondsRealtime(timeout);
+
+        if (!IsCurrentConnectionAttempt(generation, connection) || !isConnecting)
+            yield break;
+
+        // The socket can become Open just before its main-thread OnOpen action is
+        // drained. Give that action one more frame before timing it out.
+        bool socketAlreadyOpen = false;
+
+        try
+        {
+            socketAlreadyOpen = connection.State == WebSocketState.Open;
+        }
+        catch (Exception stateException)
+        {
+            Debug.LogWarning($"WebSocket timeout state check failed: {stateException.Message}");
+        }
+
+        if (socketAlreadyOpen)
+            yield return null;
+
+        if (!IsCurrentConnectionAttempt(generation, connection) || !isConnecting)
+            yield break;
+
+        connectionAttemptTimeoutCoroutine = null;
+        connectionAttemptGeneration++;
+        websocket = null;
+        isConnecting = false;
+        CancelAutomaticQrStartIfCurrent(automaticQrStartGeneration);
+
+        try
+        {
+            connection.CancelConnection();
+        }
+        catch (Exception cancelException)
+        {
+            Debug.LogWarning($"Timed-out WebSocket cancel failed: {cancelException.Message}");
+        }
+
+        ReplaceLatestDeviceData(null);
+        UpdateDisplay(WaitingForDataMessage);
+        UpdateStatus($"Connection timed out: {activeServerIp}", Color.red);
+        PublishServerConnection(false, true);
+        ScheduleNextAutomaticReconnect();
+    }
+
+    private void CancelConnectionAttemptTimeout()
+    {
+        if (connectionAttemptTimeoutCoroutine == null)
+            return;
+
+        StopCoroutine(connectionAttemptTimeoutCoroutine);
+        connectionAttemptTimeoutCoroutine = null;
+    }
+
+    private void CancelOrCloseSupersededConnection(WebSocket connection)
+    {
+        if (connection == null)
+            return;
+
+        try
+        {
+            WebSocketState state = connection.State;
+            if (state == WebSocketState.Connecting ||
+                state == WebSocketState.Open ||
+                state == WebSocketState.Closing)
+            {
+                // Cancellation guarantees cleanup cannot hold the replacement
+                // connection behind an unresponsive close handshake.
+                connection.CancelConnection();
+            }
+        }
+        catch (Exception closeException)
+        {
+            Debug.LogWarning($"Previous WebSocket cleanup failed: {closeException.Message}");
+        }
+    }
+
+    private void PublishServerConnection(bool connected, bool force)
+    {
+        bool changed = isServerConnected != connected;
+        isServerConnected = connected;
+
+        if (changed || force)
+            OnServerConnectionChanged?.Invoke(connected);
+    }
+
+    private void ResetAutomaticReconnectDelay()
+    {
+        nextAutomaticReconnectDelay =
+            Mathf.Max(0.25f, automaticReconnectInitialRetryDelay);
+    }
+
+    private void ScheduleNextAutomaticReconnect()
+    {
+        if (!autoReconnectSavedServer ||
+            !hasSavedServerIp ||
+            isShuttingDown ||
+            automaticReconnectCoroutine != null)
+        {
+            return;
+        }
+
+        float maximumDelay = Mathf.Max(
+            Mathf.Max(0.25f, automaticReconnectInitialRetryDelay),
+            automaticReconnectMaxRetryDelay);
+        float delay = Mathf.Clamp(nextAutomaticReconnectDelay, 0.25f, maximumDelay);
+        nextAutomaticReconnectDelay = Mathf.Min(maximumDelay, delay * 2f);
+        ScheduleAutomaticReconnect(delay);
+    }
+
+    private void ScheduleAutomaticReconnect(float delay)
+    {
+        if (!isActiveAndEnabled ||
+            isShuttingDown ||
+            !autoReconnectSavedServer ||
+            !hasSavedServerIp ||
+            IsConnected ||
+            isConnecting ||
+            automaticReconnectCoroutine != null)
+        {
+            return;
+        }
+
+        int generation = ++automaticReconnectGeneration;
+        automaticReconnectCoroutine = StartCoroutine(
+            AutomaticReconnectAfterDelay(Mathf.Max(0f, delay), generation));
+    }
+
+    private IEnumerator AutomaticReconnectAfterDelay(float delay, int generation)
+    {
+        if (delay > 0f)
+            yield return new WaitForSecondsRealtime(delay);
+
+        if (generation != automaticReconnectGeneration || isShuttingDown)
+            yield break;
+
+        automaticReconnectCoroutine = null;
+
+        if (!IsConnected && !isConnecting && hasSavedServerIp)
+        {
+            // Restoring a saved placement must never force the QR camera open.
+            Connect(savedIp, false, true);
+        }
+    }
+
+    private void CancelScheduledAutomaticReconnect()
+    {
+        automaticReconnectGeneration++;
+
+        if (automaticReconnectCoroutine != null)
+        {
+            StopCoroutine(automaticReconnectCoroutine);
+            automaticReconnectCoroutine = null;
         }
     }
 
@@ -506,11 +819,32 @@ public class RadiationReceiver : MonoBehaviour
 #endif
     }
 
-    private async void OnDestroy()
+    private void OnApplicationPause(bool pauseStatus)
     {
-        CancelPendingQrScan();
+        if (pauseStatus ||
+            !hasStarted ||
+            !reconnectWhenApplicationResumes ||
+            IsConnected ||
+            isConnecting)
+        {
+            return;
+        }
 
-        if (websocket != null)
-            await websocket.Close();
+        ScheduleAutomaticReconnect(automaticReconnectStartDelay);
+    }
+
+    private void OnDestroy()
+    {
+        isShuttingDown = true;
+        connectionAttemptGeneration++;
+        CancelScheduledAutomaticReconnect();
+        CancelConnectionAttemptTimeout();
+        CancelPendingQrScan();
+        isConnecting = false;
+        PublishServerConnection(false, true);
+
+        WebSocket closingConnection = websocket;
+        websocket = null;
+        CancelOrCloseSupersededConnection(closingConnection);
     }
 }

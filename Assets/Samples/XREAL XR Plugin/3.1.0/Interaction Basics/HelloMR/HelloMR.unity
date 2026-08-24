@@ -783,6 +783,7 @@ GameObject:
   - component: {fileID: 588933900}
   - component: {fileID: 588933899}
   - component: {fileID: 588933901}
+  - component: {fileID: 588933902}
   m_Layer: 0
   m_Name: DetectorWorldMarkerManager
   m_TagString: Untagged
@@ -815,10 +816,13 @@ MonoBehaviour:
   useCoordinateDatabase: 1
   coordinateDatabase: {fileID: 906282734}
   loadSavedCoordinatesOnStart: 1
-  useSpatialAnchors: 0
-  spatialAnchorManager: {fileID: 0}
-  createSpatialAnchorOnQr: 0
+  useSpatialAnchors: 1
+  spatialAnchorManager: {fileID: 588933902}
+  createSpatialAnchorOnQr: 1
   parentMarkerToAnchor: 1
+  hideMarkersUntilServerConnected: 1
+  radiationReceiver: {fileID: 2005687756}
+  cancelSelectionMaxAngleDegrees: 12
   usePreviewCenterPlacement: 1
   defaultPlacementDistanceMeters: 2
   followPreviewCenterUntilPlaced: 1
@@ -839,10 +843,11 @@ MonoBehaviour:
   rescanPositionBlend: 0.55
   fixedMarkerSize: 0.2
   markerAlpha: 0.9
+  globeSurfaceBrightness: 0.16
   globeLongitudeLines: 12
   globeLatitudeLines: 6
-  globeGridLineWidth: 0.04
-  globeRimWidth: 0.18
+  globeGridLineWidth: 0.018
+  globeRimWidth: 0.08
   forceDedicatedTransparentShader: 1
   showLabel: 0
   showDistanceInLabel: 1
@@ -893,6 +898,28 @@ MonoBehaviour:
   gazeSelectionAngleDegrees: 8
   screenEdgeMargin: 0.05
   indicatorFontSize: 28
+--- !u!114 &588933902
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 588933898}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b578e87efa6717944a9330920c34ffbc, type: 3}
+  m_Name:
+  m_EditorClassIdentifier:
+  anchorManager: {fileID: 624047415}
+  coordinateDatabase: {fileID: 906282734}
+  saveDelaySeconds: 0.5
+  saveAttemptCount: 3
+  saveRetryDelaySeconds: 2
+  eraseOldAnchorOnRescan: 1
+  loadAnchorsOnStart: 1
+  loadDelaySeconds: 1
+  anchorSubsystemReadyTimeoutSeconds: 8
+  loadedAnchorTrackingTimeoutSeconds: 30
 --- !u!20 &609993946 stripped
 Camera:
   m_CorrespondingSourceObject: {fileID: 9011500862288746601, guid: 3182b5074a6bf3d4887a44a38cbb9cb6, type: 3}
@@ -1980,6 +2007,12 @@ MonoBehaviour:
   statusText: {fileID: 0}
   defaultIp: 192.168.0.60
   serverPort: 5002
+  autoReconnectSavedServer: 1
+  automaticReconnectStartDelay: 0.35
+  automaticReconnectInitialRetryDelay: 2
+  automaticReconnectMaxRetryDelay: 15
+  connectionAttemptTimeout: 10
+  reconnectWhenApplicationResumes: 1
   openKeyboardOnStart: 0
   keyboardOpenDelay: 0.5
   connectWhenKeyboardDone: 1

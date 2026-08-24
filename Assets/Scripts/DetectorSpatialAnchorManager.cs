@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 using UnityEngine.XR.ARSubsystems;
@@ -8,10 +9,13 @@ using UnityEngine.XR.ARSubsystems;
 /// <summary>
 /// Optional spatial-anchor layer.
 /// It saves detector IDs to persistent anchor GUIDs and loads those anchors again on app start.
-/// The detector still has JSON fallback coordinates in DetectorCoordinateDatabase.
+/// JSON coordinates remain as placement metadata, but are not treated as a physical-space
+/// fallback after restart because Unity world coordinates are session-relative.
 /// </summary>
 public class DetectorSpatialAnchorManager : MonoBehaviour
 {
+    private static readonly Vector3 LoadedAnchorWaitingPosition = new Vector3(9999f, 9999f, 9999f);
+
     public static DetectorSpatialAnchorManager Instance { get; private set; }
 
     [Header("References")]
@@ -22,11 +26,15 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
 
     [Header("Saving")]
     [SerializeField] private float saveDelaySeconds = 0.5f;
+    [SerializeField, Min(1)] private int saveAttemptCount = 3;
+    [SerializeField, Min(0.1f)] private float saveRetryDelaySeconds = 2.0f;
     [SerializeField] private bool eraseOldAnchorOnRescan = true;
 
     [Header("Loading")]
     [SerializeField] private bool loadAnchorsOnStart = true;
     [SerializeField] private float loadDelaySeconds = 1.0f;
+    [SerializeField] private float anchorSubsystemReadyTimeoutSeconds = 8.0f;
+    [SerializeField] private float loadedAnchorTrackingTimeoutSeconds = 30.0f;
 
     public event Action<string, ARAnchor, string> AnchorSaved;
     public event Action<string, ARAnchor, string> AnchorLoaded;
@@ -63,14 +71,29 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
             if (loadDelaySeconds > 0f)
                 yield return new WaitForSeconds(loadDelaySeconds);
 
-            LoadAnchorsFromDatabase();
+            float deadline = Time.realtimeSinceStartup + Mathf.Max(0f, anchorSubsystemReadyTimeoutSeconds);
+            while (!IsReady() && Time.realtimeSinceStartup < deadline)
+                yield return null;
+
+            if (IsReady())
+            {
+                LoadAnchorsFromDatabase();
+            }
+            else
+            {
+                Debug.LogWarning(
+                    "[DetectorSpatialAnchorManager] Persistent anchors were not loaded because " +
+                    "the AR anchor subsystem did not become ready.");
+            }
         }
     }
 
     public bool IsReady()
     {
         EnsureReferences();
-        return anchorManager != null;
+        return anchorManager != null &&
+               anchorManager.isActiveAndEnabled &&
+               anchorManager.subsystem != null;
     }
 
     public bool TryGetLoadedAnchor(string detectorId, out ARAnchor anchor)
@@ -96,44 +119,113 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
 
         anchorsByDetectorId.TryGetValue(detectorId, out ARAnchor previousAnchor);
         int generation = AdvanceOperationGeneration(detectorId);
-        StartCoroutine(CreateAndSaveRoutine(detectorId, position, rotation, generation, previousAnchor));
+        CreateAndSaveAnchorCandidate(detectorId, position, rotation, generation, previousAnchor);
     }
 
-    private IEnumerator CreateAndSaveRoutine(
+    private void CreateAndSaveAnchorCandidate(
         string detectorId,
         Vector3 position,
         Quaternion rotation,
         int generation,
         ARAnchor previousAnchor)
     {
-        GameObject anchorObject = new GameObject($"SpatialAnchor_{detectorId}");
-        anchorObject.transform.SetParent(transform, true);
-        anchorObject.transform.SetPositionAndRotation(position, rotation);
+        GameObject anchorObject = null;
+        ARAnchor anchor = null;
 
-        ARAnchor anchor = anchorObject.AddComponent<ARAnchor>();
-        // Keep an unsaved candidate out of the committed-anchor lookup. This also
-        // prevents a later cancel/rescan from losing the previous persisted anchor.
-        pendingAnchorsByDetectorId[detectorId] = anchor;
-
-        if (saveDelaySeconds > 0f)
-            yield return new WaitForSeconds(saveDelaySeconds);
-        else
-            yield return null;
-
-        if (!IsCurrentOperation(detectorId, generation))
+        try
         {
-            CleanupPendingAnchor(detectorId, anchor);
-            yield break;
-        }
+            if (!IsReady())
+            {
+                string message = "AR anchor subsystem is not ready.";
+                AnchorSaveFailed?.Invoke(detectorId, message);
+                RestorePreviousRuntimeAnchor(detectorId, previousAnchor, generation);
+                return;
+            }
 
-        SaveAnchorAsync(detectorId, anchor, generation, previousAnchor);
+            // XREAL's own Anchors sample uses the synchronous ARAnchor-component
+            // path. Its Unity 6 TryAddAnchorAsync provider completes from Task.Run
+            // without switching back to Unity's main thread, so creating the
+            // trackable synchronously here avoids touching Unity objects off-thread.
+            anchorObject = new GameObject($"SpatialAnchor_{detectorId}");
+            anchorObject.transform.SetParent(transform, true);
+            anchorObject.transform.SetPositionAndRotation(position, rotation);
+            anchor = anchorObject.AddComponent<ARAnchor>();
+
+            if (!IsCurrentOperation(detectorId, generation))
+            {
+                if (anchor != null)
+                    Destroy(anchor.gameObject);
+                else if (anchorObject != null)
+                    Destroy(anchorObject);
+
+                return;
+            }
+
+            if (anchor == null ||
+                !anchor.enabled ||
+                anchor.trackableId == TrackableId.invalidId)
+            {
+                string message = "XREAL failed to add the runtime AR anchor.";
+                Debug.LogWarning($"[DetectorSpatialAnchorManager] Anchor creation failed for {detectorId}: {message}");
+                AnchorSaveFailed?.Invoke(detectorId, message);
+
+                if (anchor != null)
+                    Destroy(anchor.gameObject);
+                else if (anchorObject != null)
+                    Destroy(anchorObject);
+
+                RestorePreviousRuntimeAnchor(detectorId, previousAnchor, generation);
+                return;
+            }
+
+            anchor.name = $"SpatialAnchor_{detectorId}";
+
+            // Keep an unsaved candidate out of the committed-anchor lookup. This
+            // prevents a late cancel/rescan from losing the previous saved anchor.
+            pendingAnchorsByDetectorId[detectorId] = anchor;
+
+            if (saveDelaySeconds > 0f)
+                StartCoroutine(SaveAnchorAfterDelayRoutine(
+                    detectorId, anchor, generation, previousAnchor));
+            else
+                SaveAnchorAsync(detectorId, anchor, generation, previousAnchor);
+        }
+        catch (Exception e)
+        {
+            if (anchor != null)
+                CleanupPendingAnchor(detectorId, anchor);
+            else if (anchorObject != null)
+                Destroy(anchorObject);
+
+            if (!IsCurrentOperation(detectorId, generation))
+                return;
+
+            Debug.LogError($"[DetectorSpatialAnchorManager] Anchor creation exception for {detectorId}: {e.Message}");
+            AnchorSaveFailed?.Invoke(detectorId, e.Message);
+            RestorePreviousRuntimeAnchor(detectorId, previousAnchor, generation);
+        }
+    }
+
+    private IEnumerator SaveAnchorAfterDelayRoutine(
+        string detectorId,
+        ARAnchor anchor,
+        int generation,
+        ARAnchor previousAnchor)
+    {
+        yield return new WaitForSeconds(saveDelaySeconds);
+
+        if (IsCurrentOperation(detectorId, generation))
+            SaveAnchorAsync(detectorId, anchor, generation, previousAnchor);
+        else
+            CleanupPendingAnchor(detectorId, anchor);
     }
 
     private async void SaveAnchorAsync(
         string detectorId,
         ARAnchor anchor,
         int generation,
-        ARAnchor previousAnchor)
+        ARAnchor previousAnchor,
+        int attemptNumber = 1)
     {
         try
         {
@@ -156,11 +248,15 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
                 oldGuid = oldRecord.anchorPersistentGuid;
 
             var result = await anchorManager.TrySaveAnchorAsync(anchor);
+            // XREAL 3.1.0 completes save from Task.Run. Explicitly marshal back
+            // before reading Unity state, mutating dictionaries/DB, or publishing
+            // events that update marker GameObjects.
+            await Awaitable.MainThreadAsync();
 
             if (!IsCurrentOperation(detectorId, generation))
             {
                 if (result.status.IsSuccess())
-                    EraseAnchorByGuid(result.value.ToString());
+                    EraseAnchorByGuid(result.value.guid.ToString("D"));
 
                 CleanupPendingAnchor(detectorId, anchor);
                 return;
@@ -168,7 +264,10 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
 
             if (result.status.IsSuccess())
             {
-                string guid = result.value.ToString();
+                // SerializableGuid.ToString() is "16 hex-16 hex", not a standard
+                // System.Guid string. Persist the canonical Guid so it round-trips
+                // across application launches and keep legacy parsing below.
+                string guid = result.value.guid.ToString("D");
                 RemovePendingAnchorRegistration(detectorId, anchor);
                 anchorsByDetectorId[detectorId] = anchor;
                 anchorGuidByDetectorId[detectorId] = guid;
@@ -188,6 +287,13 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
             else
             {
                 string message = $"TrySaveAnchorAsync failed: {result.status}";
+
+                if (ScheduleSaveRetryIfAvailable(
+                    detectorId, anchor, generation, previousAnchor, attemptNumber, message))
+                {
+                    return;
+                }
+
                 Debug.LogWarning($"[DetectorSpatialAnchorManager] Anchor save failed for {detectorId}: {message}");
                 AnchorSaveFailed?.Invoke(detectorId, message);
                 CleanupPendingAnchor(detectorId, anchor);
@@ -196,9 +302,17 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
         }
         catch (Exception e)
         {
+            await Awaitable.MainThreadAsync();
+
             if (!IsCurrentOperation(detectorId, generation))
             {
                 CleanupPendingAnchor(detectorId, anchor);
+                return;
+            }
+
+            if (ScheduleSaveRetryIfAvailable(
+                detectorId, anchor, generation, previousAnchor, attemptNumber, e.Message))
+            {
                 return;
             }
 
@@ -209,13 +323,54 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
         }
     }
 
+    private bool ScheduleSaveRetryIfAvailable(
+        string detectorId,
+        ARAnchor anchor,
+        int generation,
+        ARAnchor previousAnchor,
+        int attemptNumber,
+        string reason)
+    {
+        int maxAttempts = Mathf.Max(1, saveAttemptCount);
+        if (!IsCurrentOperation(detectorId, generation) ||
+            anchor == null ||
+            attemptNumber >= maxAttempts)
+        {
+            return false;
+        }
+
+        int nextAttempt = attemptNumber + 1;
+        Debug.LogWarning(
+            $"[DetectorSpatialAnchorManager] Anchor save attempt {attemptNumber}/{maxAttempts} " +
+            $"failed for {detectorId}; retrying in {saveRetryDelaySeconds:F1}s. {reason}");
+
+        StartCoroutine(RetrySaveAnchorRoutine(
+            detectorId, anchor, generation, previousAnchor, nextAttempt));
+        return true;
+    }
+
+    private IEnumerator RetrySaveAnchorRoutine(
+        string detectorId,
+        ARAnchor anchor,
+        int generation,
+        ARAnchor previousAnchor,
+        int attemptNumber)
+    {
+        yield return new WaitForSeconds(Mathf.Max(0.1f, saveRetryDelaySeconds));
+
+        if (IsCurrentOperation(detectorId, generation) && anchor != null)
+            SaveAnchorAsync(detectorId, anchor, generation, previousAnchor, attemptNumber);
+        else
+            CleanupPendingAnchor(detectorId, anchor);
+    }
+
     public void LoadAnchorsFromDatabase()
     {
         EnsureReferences();
 
-        if (anchorManager == null)
+        if (!IsReady())
         {
-            Debug.LogWarning("[DetectorSpatialAnchorManager] Cannot load anchors. ARAnchorManager is missing.");
+            Debug.LogWarning("[DetectorSpatialAnchorManager] Cannot load anchors. AR anchor subsystem is not ready.");
             return;
         }
 
@@ -243,9 +398,9 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
             return;
 
         EnsureReferences();
-        if (anchorManager == null)
+        if (!IsReady())
         {
-            AnchorLoadFailed?.Invoke(detectorId, "ARAnchorManager is missing.");
+            AnchorLoadFailed?.Invoke(detectorId, "AR anchor subsystem is not ready.");
             return;
         }
 
@@ -257,6 +412,7 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
             return;
         }
 
+        string canonicalGuid = serializableGuid.guid.ToString("D");
         anchorsByDetectorId.TryGetValue(detectorId, out ARAnchor previousAnchor);
         int generation = AdvanceOperationGeneration(detectorId);
 
@@ -278,13 +434,14 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
                 if (anchor != null)
                 {
                     anchor.name = $"LoadedSpatialAnchor_{detectorId}";
-                    anchorsByDetectorId[detectorId] = anchor;
-                    anchorGuidByDetectorId[detectorId] = persistentGuid;
-                    Debug.Log($"[DetectorSpatialAnchorManager] Anchor loaded: detector={detectorId}, guid={persistentGuid}");
-                    AnchorLoaded?.Invoke(detectorId, anchor, persistentGuid);
-
-                    if (previousAnchor != null && previousAnchor != anchor && previousAnchor.transform.childCount == 0)
-                        Destroy(previousAnchor.gameObject);
+                    pendingAnchorsByDetectorId[detectorId] = anchor;
+                    StartCoroutine(WaitForLoadedAnchorTrackingRoutine(
+                        detectorId,
+                        anchor,
+                        canonicalGuid,
+                        persistentGuid,
+                        generation,
+                        previousAnchor));
                 }
                 else
                 {
@@ -306,6 +463,79 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
             Debug.LogError($"[DetectorSpatialAnchorManager] Load exception for {detectorId}: {e.Message}");
             AnchorLoadFailed?.Invoke(detectorId, e.Message);
         }
+    }
+
+    private IEnumerator WaitForLoadedAnchorTrackingRoutine(
+        string detectorId,
+        ARAnchor anchor,
+        string canonicalGuid,
+        string originalGuid,
+        int generation,
+        ARAnchor previousAnchor)
+    {
+        float deadline = Time.realtimeSinceStartup + Mathf.Max(0.1f, loadedAnchorTrackingTimeoutSeconds);
+
+        // Follow the XREAL Anchors sample: a successful load returns an ARAnchor
+        // before the mapping system has necessarily located it. Moving the hidden
+        // anchor to a sentinel lets us distinguish the later provider pose update
+        // from the provisional load result without ever creating a visible marker.
+        if (anchor != null)
+            anchor.transform.position = LoadedAnchorWaitingPosition;
+
+        // XREAL returns the persisted anchor before its physical map has necessarily
+        // relocalized. Publishing its provisional pose causes a visible origin/old-
+        // coordinate flash, so wait for a real Tracking state first.
+        while (IsCurrentOperation(detectorId, generation) &&
+               anchor != null &&
+               (anchor.trackingState != TrackingState.Tracking ||
+                !HasLocatedLoadedAnchorPose(anchor)) &&
+               Time.realtimeSinceStartup < deadline)
+        {
+            yield return null;
+        }
+
+        if (!IsCurrentOperation(detectorId, generation))
+        {
+            CleanupPendingAnchor(detectorId, anchor);
+            yield break;
+        }
+
+        if (anchor == null ||
+            anchor.trackingState != TrackingState.Tracking ||
+            !HasLocatedLoadedAnchorPose(anchor))
+        {
+            string message =
+                $"Loaded anchor did not reach Tracking within {loadedAnchorTrackingTimeoutSeconds:F1}s.";
+            Debug.LogWarning($"[DetectorSpatialAnchorManager] {message} detector={detectorId}");
+            AnchorLoadFailed?.Invoke(detectorId, message);
+            CleanupPendingAnchor(detectorId, anchor);
+            RestorePreviousRuntimeAnchor(detectorId, previousAnchor, generation);
+            yield break;
+        }
+
+        RemovePendingAnchorRegistration(detectorId, anchor);
+        anchorsByDetectorId[detectorId] = anchor;
+        anchorGuidByDetectorId[detectorId] = canonicalGuid;
+
+        // Upgrade GUIDs written by older builds that used
+        // SerializableGuid.ToString().
+        if (coordinateDatabase != null &&
+            !string.Equals(originalGuid, canonicalGuid, StringComparison.OrdinalIgnoreCase))
+        {
+            coordinateDatabase.SaveOrUpdateAnchorGuid(detectorId, canonicalGuid);
+        }
+
+        Debug.Log($"[DetectorSpatialAnchorManager] Anchor located: detector={detectorId}, guid={canonicalGuid}");
+        AnchorLoaded?.Invoke(detectorId, anchor, canonicalGuid);
+
+        if (previousAnchor != null && previousAnchor != anchor && previousAnchor.transform.childCount == 0)
+            Destroy(previousAnchor.gameObject);
+    }
+
+    private bool HasLocatedLoadedAnchorPose(ARAnchor anchor)
+    {
+        return anchor != null &&
+               (anchor.transform.position - LoadedAnchorWaitingPosition).sqrMagnitude > 1f;
     }
 
     public void EraseAnchorForDetector(string detectorId)
@@ -354,10 +584,13 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
         try
         {
             var result = await anchorManager.TryEraseAnchorAsync(serializableGuid);
+            // XREAL 3.1.0 also completes erase from Task.Run.
+            await Awaitable.MainThreadAsync();
             Debug.Log($"[DetectorSpatialAnchorManager] Erase anchor {persistentGuid}: {result}");
         }
         catch (Exception e)
         {
+            await Awaitable.MainThreadAsync();
             Debug.LogWarning($"[DetectorSpatialAnchorManager] Erase failed: {e.Message}");
         }
     }
@@ -411,14 +644,24 @@ public class DetectorSpatialAnchorManager : MonoBehaviour
     {
         serializableGuid = default;
 
-        if (!Guid.TryParse(guidText, out Guid systemGuid))
-            return false;
+        if (Guid.TryParse(guidText, out Guid systemGuid))
+        {
+            serializableGuid = new SerializableGuid(systemGuid);
+            return true;
+        }
 
-        byte[] bytes = systemGuid.ToByteArray();
-        ulong low = BitConverter.ToUInt64(bytes, 0);
-        ulong high = BitConverter.ToUInt64(bytes, 8);
-        serializableGuid = new SerializableGuid(low, high);
-        return true;
+        // AR Foundation 6 SerializableGuid.ToString() uses two 16-digit hex
+        // numbers separated by a dash. Previous app builds stored that value.
+        string[] legacyParts = guidText.Split('-');
+        if (legacyParts.Length == 2 &&
+            ulong.TryParse(legacyParts[0], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out ulong low) &&
+            ulong.TryParse(legacyParts[1], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out ulong high))
+        {
+            serializableGuid = new SerializableGuid(low, high);
+            return true;
+        }
+
+        return false;
     }
 
     private void EnsureReferences()

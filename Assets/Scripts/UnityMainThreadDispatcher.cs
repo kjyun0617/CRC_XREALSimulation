@@ -5,7 +5,7 @@ using UnityEngine;
 public class UnityMainThreadDispatcher : MonoBehaviour
 {
     private static UnityMainThreadDispatcher instance;
-    private Queue<Action> queue = new Queue<Action>();      // codes in the Action will be excuted later(after mainthread)
+    private readonly Queue<Action> queue = new Queue<Action>();
 
     public static UnityMainThreadDispatcher Instance
     {
@@ -23,12 +23,29 @@ public class UnityMainThreadDispatcher : MonoBehaviour
 
     public static void Enqueue(Action action)
     {
-        Instance.queue.Enqueue(action);
+        if (action == null)
+            return;
+
+        UnityMainThreadDispatcher dispatcher = Instance;
+        lock (dispatcher.queue)
+            dispatcher.queue.Enqueue(action);
     }
     
-    void Update()
+    private void Update()
     {
-        while(queue.Count > 0)
-            queue.Dequeue()?.Invoke();
+        while (true)
+        {
+            Action action;
+
+            lock (queue)
+            {
+                if (queue.Count == 0)
+                    return;
+
+                action = queue.Dequeue();
+            }
+
+            action.Invoke();
+        }
     }
 }

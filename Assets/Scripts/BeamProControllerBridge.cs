@@ -136,8 +136,8 @@ public class BeamProControllerBridge : MonoBehaviour
     }
 
     /// <summary>
-    /// Connects to the server. If controllerIpInputField has text, that IP is used.
-    /// Otherwise, this triggers RadiationReceiver's existing connect-button behavior.
+    /// Connects to the server. If the controller field is empty, the receiver's
+    /// saved/default server IP is used.
     /// </summary>
     public void ConnectToServer()
     {
@@ -151,7 +151,10 @@ public class BeamProControllerBridge : MonoBehaviour
 
         string ip = controllerIpInputField != null
             ? controllerIpInputField.text.Trim()
-            : "";
+            : radiationReceiver.CurrentServerIp;
+
+        if (string.IsNullOrWhiteSpace(ip))
+            ip = radiationReceiver.CurrentServerIp;
 
         if (string.IsNullOrWhiteSpace(ip))
         {
@@ -181,6 +184,12 @@ public class BeamProControllerBridge : MonoBehaviour
         string message,
         Color color)
     {
+        ResolveReferences();
+
+        // RadiationReceiver may Awake after this prefab. Its first status update
+        // is a reliable point at which the PlayerPrefs-backed address is loaded.
+        SyncControllerIpField();
+
         if (controllerStatusText == null)
             return;
 
@@ -377,7 +386,9 @@ public class BeamProControllerBridge : MonoBehaviour
         if (controllerIpInputField == null || radiationReceiver == null)
             return;
 
-        if (string.IsNullOrWhiteSpace(controllerIpInputField.text))
+        // Do not overwrite text while the user is editing it, but always replace
+        // serialized prefab defaults with the last address saved by the receiver.
+        if (!controllerIpInputField.isFocused)
             controllerIpInputField.SetTextWithoutNotify(radiationReceiver.CurrentServerIp);
     }
 
