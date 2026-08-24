@@ -1,5 +1,8 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
 using NativeWebSocket;
 using Newtonsoft.Json.Linq;
 using TMPro;
@@ -16,7 +19,8 @@ public class RadiationReceiver : MonoBehaviour
     public static event DisplayTextChangedSignature OnDisplayTextChanged;
 
     private string currentDisplayMessage = WaitingForDataMessage;
-    private readonly Dictionary<string, float> latestDeviceData = new Dictionary<string, float>();
+    private readonly Dictionary<string, float> latestDeviceData =
+        new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
 
     public string CurrentDisplayMessage => currentDisplayMessage;
     public IReadOnlyDictionary<string, float> LatestDeviceData => latestDeviceData;
@@ -47,6 +51,9 @@ public class RadiationReceiver : MonoBehaviour
     [SerializeField] private float qrStartDelayAfterConnect = 0.3f;
 
     private WebSocket websocket;
+    private Coroutine qrStartCoroutine;
+    private int automaticQrStartGeneration;
+    private bool automaticQrStartExpected;
     private string savedIp;
     private bool isConnecting;
     private string currentStatusMessage = "";
@@ -57,6 +64,7 @@ public class RadiationReceiver : MonoBehaviour
     public string CurrentServerIp => string.IsNullOrWhiteSpace(savedIp) ? defaultIp : savedIp;
     public bool IsConnected => websocket != null && websocket.State == WebSocketState.Open;
     public bool IsConnecting => isConnecting;
+    public bool IsQrScanPending => automaticQrStartExpected || qrStartCoroutine != null;
 
 #if UNITY_ANDROID && !UNITY_EDITOR
     private TouchScreenKeyboard activeKeyboard;
@@ -222,6 +230,10 @@ public class RadiationReceiver : MonoBehaviour
 
         isConnecting = true;
 
+        CancelPendingQrScan();
+        int qrStartGeneration = automaticQrStartGeneration;
+        automaticQrStartExpected = startQrCameraAfterConnect;
+
         if (websocket != null && websocket.State == WebSocketState.Open)
             await websocket.Close();
 
@@ -238,10 +250,26 @@ public class RadiationReceiver : MonoBehaviour
             UnityMainThreadDispatcher.Enqueue(() =>
             {
                 ReplaceLatestDeviceData(null);
+                UpdateDisplay(WaitingForDataMessage);
                 UpdateStatus($"Connected: {cleanIp}", Color.green);
 
-                if (startQrCameraAfterConnect)
-                    StartCoroutine(StartQrCameraAfterDelay());
+                if (qrStartGeneration == automaticQrStartGeneration)
+                {
+                    bool shouldStartQr = automaticQrStartExpected;
+                    automaticQrStartExpected = false;
+
+                    if (shouldStartQr)
+                    {
+                        if (qrScanner == null)
+                            qrScanner = FindFirstObjectByType<QRScanner>();
+
+                        if (qrScanner == null || !qrScanner.IsScanActive)
+                        {
+                            qrStartCoroutine =
+                                StartCoroutine(StartQrCameraAfterDelay(qrStartGeneration));
+                        }
+                    }
+                }
             });
         };
 
@@ -256,15 +284,16 @@ public class RadiationReceiver : MonoBehaviour
                 var dict = root["deviceDataDictionary"]?.ToObject<Dictionary<string, float>>();
                 if (dict == null) return;
 
-                string result = "";
-                foreach (var kvp in dict)
-                    result += $"Device: {kvp.Key}  Radiation: {kvp.Value}\n";
+                Dictionary<string, float> normalizedData = CreateNormalizedDeviceData(dict);
+
+                string result = BuildCpsDetectorList(normalizedData);
 
                 UnityMainThreadDispatcher.Enqueue(() =>
                 {
-                    ReplaceLatestDeviceData(dict);
+                    ReplaceLatestDeviceData(normalizedData);
                     UpdateDisplay(result);
-                    OnRadiationDataReceived?.Invoke(new Dictionary<string, float>(dict));
+                    OnRadiationDataReceived?.Invoke(
+                        new Dictionary<string, float>(latestDeviceData, StringComparer.OrdinalIgnoreCase));
                 });
             }
             catch (System.Exception e)
@@ -279,7 +308,9 @@ public class RadiationReceiver : MonoBehaviour
             isConnecting = false;
             UnityMainThreadDispatcher.Enqueue(() =>
             {
+                CancelAutomaticQrStartIfCurrent(qrStartGeneration);
                 ReplaceLatestDeviceData(null);
+                UpdateDisplay(WaitingForDataMessage);
                 UpdateStatus($"Error: {e}", Color.red);
             });
         };
@@ -290,7 +321,9 @@ public class RadiationReceiver : MonoBehaviour
             isConnecting = false;
             UnityMainThreadDispatcher.Enqueue(() =>
             {
+                CancelAutomaticQrStartIfCurrent(qrStartGeneration);
                 ReplaceLatestDeviceData(null);
+                UpdateDisplay(WaitingForDataMessage);
                 UpdateStatus("Disconnected", Color.red);
             });
         };
@@ -303,7 +336,9 @@ public class RadiationReceiver : MonoBehaviour
         {
             isConnecting = false;
             Debug.LogError($"WebSocket connection failed: {e.Message}");
+            CancelAutomaticQrStartIfCurrent(qrStartGeneration);
             ReplaceLatestDeviceData(null);
+            UpdateDisplay(WaitingForDataMessage);
             UpdateStatus($"Connection failed: {e.Message}", Color.red);
         }
     }
@@ -316,20 +351,104 @@ public class RadiationReceiver : MonoBehaviour
             return;
 
         foreach (var pair in data)
-            latestDeviceData[pair.Key] = pair.Value;
+        {
+            string detectorId = string.IsNullOrWhiteSpace(pair.Key) ? "" : pair.Key.Trim();
+            if (!string.IsNullOrEmpty(detectorId))
+                latestDeviceData[detectorId] = pair.Value;
+        }
     }
 
-    private IEnumerator StartQrCameraAfterDelay()
+    private Dictionary<string, float> CreateNormalizedDeviceData(Dictionary<string, float> data)
+    {
+        Dictionary<string, float> normalized =
+            new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+
+        if (data == null)
+            return normalized;
+
+        foreach (var pair in data)
+        {
+            string detectorId = string.IsNullOrWhiteSpace(pair.Key) ? "" : pair.Key.Trim();
+            if (!string.IsNullOrEmpty(detectorId))
+                normalized[detectorId] = pair.Value;
+        }
+
+        return normalized;
+    }
+
+    private string BuildCpsDetectorList(Dictionary<string, float> data)
+    {
+        if (data == null || data.Count == 0)
+            return WaitingForDataMessage;
+
+        List<string> detectorIds = new List<string>(data.Keys);
+        detectorIds.Sort(StringComparer.OrdinalIgnoreCase);
+
+        StringBuilder builder = new StringBuilder(32 + detectorIds.Count * 24);
+        builder.Append("DETECTOR | CPS");
+
+        for (int i = 0; i < detectorIds.Count; i++)
+        {
+            string detectorId = detectorIds[i];
+            float value = data[detectorId];
+
+            builder.Append('\n')
+                .Append(SanitizeDetectorIdForDisplay(detectorId))
+                .Append(" | ");
+
+            if (value >= 0f && !float.IsNaN(value) && !float.IsInfinity(value))
+                builder.Append(value.ToString("F3", CultureInfo.InvariantCulture));
+            else
+                builder.Append("--");
+        }
+
+        return builder.ToString();
+    }
+
+    private string SanitizeDetectorIdForDisplay(string detectorId)
+    {
+        return string.IsNullOrEmpty(detectorId)
+            ? "--"
+            : detectorId.Replace('\r', ' ').Replace('\n', ' ').Replace('|', '/');
+    }
+
+    private IEnumerator StartQrCameraAfterDelay(int generation)
     {
         yield return new WaitForSeconds(qrStartDelayAfterConnect);
+
+        if (generation != automaticQrStartGeneration)
+            yield break;
+
+        qrStartCoroutine = null;
 
         if (qrScanner == null)
             qrScanner = FindFirstObjectByType<QRScanner>();
 
-        if (qrScanner != null)
-            qrScanner.StartScanning();
-        else
+        if (qrScanner == null)
             Debug.LogWarning("QRScanner not found. QR camera cannot start automatically.");
+        else if (!qrScanner.IsScanActive)
+            qrScanner.StartScanning();
+    }
+
+    public bool CancelPendingQrScan()
+    {
+        bool hadPendingStart = automaticQrStartExpected || qrStartCoroutine != null;
+        automaticQrStartGeneration++;
+        automaticQrStartExpected = false;
+
+        if (qrStartCoroutine != null)
+        {
+            StopCoroutine(qrStartCoroutine);
+            qrStartCoroutine = null;
+        }
+
+        return hadPendingStart;
+    }
+
+    private void CancelAutomaticQrStartIfCurrent(int generation)
+    {
+        if (generation == automaticQrStartGeneration)
+            CancelPendingQrScan();
     }
 
     private void UpdateStatus(string message, Color color)
@@ -389,6 +508,8 @@ public class RadiationReceiver : MonoBehaviour
 
     private async void OnDestroy()
     {
+        CancelPendingQrScan();
+
         if (websocket != null)
             await websocket.Close();
     }

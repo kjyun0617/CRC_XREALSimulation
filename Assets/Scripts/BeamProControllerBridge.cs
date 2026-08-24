@@ -37,6 +37,14 @@ public class BeamProControllerBridge : MonoBehaviour
 
     [Tooltip("Text child of the Start/Stop Record button.")]
     [SerializeField] private TMP_Text controllerRecordButtonText;
+
+    [Header("Detector List Layout")]
+    [SerializeField, Min(6f)] private float detectorListMinFontSize = 10f;
+    [SerializeField, Min(10f)] private float detectorListMaxFontSize = 40f;
+    [SerializeField, Min(0f)] private float detectorListHorizontalPadding = 20f;
+    [SerializeField, Min(128f)] private float detectorListHeight = 320f;
+    [SerializeField] private float detectorListCenterYOffset = 330f;
+
     [Header("Behavior")]
     [SerializeField] private bool autoFindReferences = true;
     [SerializeField] private bool logActions = true;
@@ -44,18 +52,33 @@ public class BeamProControllerBridge : MonoBehaviour
     private void Awake()
     {
         ResolveReferences();
+        ConfigureControllerDetectorList();
         SyncControllerIpField();
     }
 
     private void OnEnable()
     {
         ResolveReferences();
+        ConfigureControllerDetectorList();
         RadiationReceiver.OnServerStatusChanged += HandleServerStatusChanged;
         RadiationReceiver.OnDisplayTextChanged += HandleDisplayTextChanged;
         XREALCaptureManager.OnCaptureStateChanged += HandleCaptureStateChanged;
         RegisterControllerIpListener();
         SyncControllerIpField();
         SyncCurrentReceiverText();
+    }
+
+    private void LateUpdate()
+    {
+        if (controllerRadiationDisplayText == null)
+            return;
+
+        if (lastConfiguredScreenWidth != Screen.width ||
+            lastConfiguredScreenHeight != Screen.height ||
+            lastConfiguredSafeArea != Screen.safeArea)
+        {
+            ConfigureControllerDetectorList();
+        }
     }
 
     private void OnDisable()
@@ -170,6 +193,7 @@ public class BeamProControllerBridge : MonoBehaviour
         if (controllerRadiationDisplayText == null)
             return;
 
+        ConfigureControllerDetectorList();
         controllerRadiationDisplayText.text = message;
     }
 
@@ -214,6 +238,9 @@ public class BeamProControllerBridge : MonoBehaviour
             return;
         }
 
+        // This button starts the scanner directly, so suppress the receiver's
+        // delayed post-connect auto-start for the same connection attempt.
+        radiationReceiver?.CancelPendingQrScan();
         qrScanner.StartScanning();
         Log("StartQrScan");
     }
@@ -222,9 +249,13 @@ public class BeamProControllerBridge : MonoBehaviour
     {
         ResolveReferences();
 
+        bool stoppedPendingStart =
+            radiationReceiver != null && radiationReceiver.CancelPendingQrScan();
+
         if (qrScanner == null)
         {
-            Warn("QRScanner not found. Cannot stop QR scan.");
+            if (!stoppedPendingStart)
+                Warn("QRScanner not found. Cannot stop QR scan.");
             return;
         }
 
@@ -261,14 +292,41 @@ public class BeamProControllerBridge : MonoBehaviour
     {
         ResolveReferences();
 
+        bool qrCameraWasActive = qrScanner != null && qrScanner.IsScanActive;
+        bool delayedScanWasPending =
+            radiationReceiver != null && radiationReceiver.IsQrScanPending;
+        bool scanWasActive = qrCameraWasActive || delayedScanWasPending;
+        bool placementWasActive = markerManager != null && markerManager.HasActivePlacement;
+
+        if (delayedScanWasPending)
+            radiationReceiver.CancelPendingQrScan();
+
+        if (qrCameraWasActive)
+            qrScanner.StopScanning();
+
+        if (scanWasActive && !placementWasActive)
+        {
+            ShowControllerActionStatus("QR scan cancelled", Color.white);
+            Log("QR scan cancelled");
+            return;
+        }
+
         if (markerManager == null)
         {
             Warn("DetectorWorldMarkerManager not found. Cannot cancel placement.");
             return;
         }
 
-        markerManager.CancelCurrentFollowingDetector();
-        Log("CancelPlace");
+        if (markerManager.TryCancelCurrentDetector(out string resultMessage))
+        {
+            ShowControllerActionStatus(resultMessage, Color.white);
+            Log(resultMessage);
+        }
+        else
+        {
+            ShowControllerActionStatus(resultMessage, Color.yellow);
+            Warn(resultMessage);
+        }
     }
 
     public void CancelPlacement()
@@ -358,6 +416,69 @@ public class BeamProControllerBridge : MonoBehaviour
         {
             captureManager = UnityEngine.Object.FindFirstObjectByType<XREALCaptureManager>();
         }
+    }
+
+    private int lastConfiguredScreenWidth = -1;
+    private int lastConfiguredScreenHeight = -1;
+    private Rect lastConfiguredSafeArea = new Rect(-1f, -1f, -1f, -1f);
+
+    private void ConfigureControllerDetectorList()
+    {
+        if (controllerRadiationDisplayText == null)
+            return;
+
+        float minFontSize = Mathf.Max(6f, detectorListMinFontSize);
+        float maxFontSize = Mathf.Max(minFontSize, detectorListMaxFontSize);
+
+        controllerRadiationDisplayText.enableAutoSizing = true;
+        controllerRadiationDisplayText.fontSizeMin = minFontSize;
+        controllerRadiationDisplayText.fontSizeMax = maxFontSize;
+        controllerRadiationDisplayText.fontSize = maxFontSize;
+        controllerRadiationDisplayText.alignment = TextAlignmentOptions.TopLeft;
+        controllerRadiationDisplayText.textWrappingMode = TextWrappingModes.NoWrap;
+        controllerRadiationDisplayText.overflowMode = TextOverflowModes.Overflow;
+        controllerRadiationDisplayText.richText = false;
+        controllerRadiationDisplayText.raycastTarget = false;
+        controllerRadiationDisplayText.margin = new Vector4(8f, 8f, 8f, 8f);
+
+        RectTransform rect = controllerRadiationDisplayText.rectTransform;
+        Rect safeArea = Screen.safeArea;
+        float safeLeft = 0f;
+        float safeRight = 1f;
+
+        if (Screen.width > 0 && safeArea.width > 0f)
+        {
+            safeLeft = Mathf.Clamp01(safeArea.xMin / Screen.width);
+            safeRight = Mathf.Clamp01(safeArea.xMax / Screen.width);
+        }
+
+        if (safeRight <= safeLeft)
+        {
+            safeLeft = 0f;
+            safeRight = 1f;
+        }
+
+        float safeMidpoint = (safeLeft + safeRight) * 0.5f;
+        rect.anchorMin = new Vector2(safeLeft, 0.5f);
+        rect.anchorMax = new Vector2(safeMidpoint, 0.5f);
+        rect.pivot = new Vector2(0.5f, 0.5f);
+        rect.anchoredPosition = new Vector2(0f, detectorListCenterYOffset);
+        rect.sizeDelta = new Vector2(
+            -2f * Mathf.Max(0f, detectorListHorizontalPadding),
+            Mathf.Max(128f, detectorListHeight));
+
+        lastConfiguredScreenWidth = Screen.width;
+        lastConfiguredScreenHeight = Screen.height;
+        lastConfiguredSafeArea = safeArea;
+    }
+
+    private void ShowControllerActionStatus(string message, Color color)
+    {
+        if (controllerStatusText == null)
+            return;
+
+        controllerStatusText.text = message;
+        controllerStatusText.color = color;
     }
 
     private void Log(string message)

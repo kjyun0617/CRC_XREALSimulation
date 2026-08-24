@@ -20,7 +20,8 @@ public class DetectorCoordinateDatabase : MonoBehaviour
     [SerializeField] private bool autoSaveAfterEachChange = true;
 
     private DetectorCoordinateSaveRoot saveRoot = new DetectorCoordinateSaveRoot();
-    private readonly Dictionary<string, DetectorCoordinateRecord> recordsById = new Dictionary<string, DetectorCoordinateRecord>();
+    private readonly Dictionary<string, DetectorCoordinateRecord> recordsById =
+        new Dictionary<string, DetectorCoordinateRecord>(StringComparer.OrdinalIgnoreCase);
 
     public string SavePath => Path.Combine(Application.persistentDataPath, saveFileName);
 
@@ -164,7 +165,8 @@ public class DetectorCoordinateDatabase : MonoBehaviour
         for (int i = saveRoot.records.Count - 1; i >= 0; i--)
         {
             DetectorCoordinateRecord record = saveRoot.records[i];
-            if (record != null && NormalizeId(record.detectorId) == detectorId)
+            if (record != null &&
+                string.Equals(NormalizeId(record.detectorId), detectorId, StringComparison.OrdinalIgnoreCase))
             {
                 saveRoot.records.RemoveAt(i);
                 removed = true;
@@ -214,23 +216,42 @@ public class DetectorCoordinateDatabase : MonoBehaviour
                 return;
 
             saveRoot = loaded;
+            bool sanitizedRecords = false;
 
             for (int i = saveRoot.records.Count - 1; i >= 0; i--)
             {
                 DetectorCoordinateRecord record = saveRoot.records[i];
-                record.detectorId = NormalizeId(record.detectorId);
+                if (record == null)
+                {
+                    saveRoot.records.RemoveAt(i);
+                    sanitizedRecords = true;
+                    continue;
+                }
+
+                string normalizedDetectorId = NormalizeId(record.detectorId);
+                if (!string.Equals(record.detectorId, normalizedDetectorId, StringComparison.Ordinal))
+                    sanitizedRecords = true;
+
+                record.detectorId = normalizedDetectorId;
 
                 if (string.IsNullOrEmpty(record.detectorId))
                 {
                     saveRoot.records.RemoveAt(i);
+                    sanitizedRecords = true;
                     continue;
                 }
 
                 if (!recordsById.ContainsKey(record.detectorId))
                     recordsById.Add(record.detectorId, record);
                 else
+                {
                     saveRoot.records.RemoveAt(i);
+                    sanitizedRecords = true;
+                }
             }
+
+            if (sanitizedRecords && autoSaveAfterEachChange)
+                SaveToDisk();
 
             Debug.Log($"[DetectorCoordinateDatabase] Loaded records: {recordsById.Count}");
         }

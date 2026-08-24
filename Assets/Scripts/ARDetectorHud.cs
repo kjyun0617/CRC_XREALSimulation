@@ -6,9 +6,9 @@ using UnityEngine;
 using UnityEngine.UI;
 
 /// <summary>
-/// Head-locked AR glasses HUD for server status, detector readings, gaze highlighting,
-/// and four-direction off-screen detector indicators. It builds its own world-space
-/// canvas so no Inspector UI references are required.
+/// Head-locked AR glasses HUD for server status, detector readings, live glasses-to-detector
+/// distances, gaze highlighting, and four-direction off-screen indicators. It builds its
+/// own world-space canvas so no Inspector UI references are required.
 /// </summary>
 [DisallowMultipleComponent]
 public class ARDetectorHud : MonoBehaviour
@@ -30,7 +30,11 @@ public class ARDetectorHud : MonoBehaviour
 
     [SerializeField] private Vector2 hudPixelSize = new Vector2(720f, 430f);
     [SerializeField, Min(10f)] private float hudFontSize = 27f;
-    [SerializeField] private string radiationUnit = "uSv/h";
+    [SerializeField] private string radiationUnit = "CPS";
+    [SerializeField] private string distanceUnit = "m";
+
+    [Tooltip("Maximum detector rows kept inside the fixed XREAL HUD. Extra rows are summarized.")]
+    [SerializeField, Min(1)] private int maxVisibleDetectorRows = 9;
 
     [Header("Gaze Selection")]
     [Tooltip("A placed sphere is selected when it is this close to the view-center ray.")]
@@ -43,7 +47,11 @@ public class ARDetectorHud : MonoBehaviour
     private readonly Dictionary<string, float> latestDeviceData =
         new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
 
-    private readonly List<string> sortedDeviceIds = new List<string>();
+    private readonly List<string> sortedDisplayDetectorIds = new List<string>();
+    private readonly HashSet<string> displayDetectorIdSet =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> markerIndexByDetectorId =
+        new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
     private readonly List<DetectorWorldMarkerManager.DetectorHudMarkerState> markerStates =
         new List<DetectorWorldMarkerManager.DetectorHudMarkerState>();
     private readonly List<OffscreenState> offscreenStates = new List<OffscreenState>();
@@ -169,9 +177,7 @@ public class ARDetectorHud : MonoBehaviour
             : radiationReceiver.CurrentStatusMessage;
         serverStatusColor = radiationReceiver.CurrentStatusColor;
 
-        latestDeviceData.Clear();
-        foreach (var pair in radiationReceiver.LatestDeviceData)
-            latestDeviceData[pair.Key.Trim()] = pair.Value;
+        ReplaceLatestDeviceData(radiationReceiver.LatestDeviceData);
     }
 
     private void HandleServerStatusChanged(string message, Color color)
@@ -189,6 +195,11 @@ public class ARDetectorHud : MonoBehaviour
     }
 
     private void HandleRadiationDataReceived(Dictionary<string, float> data)
+    {
+        ReplaceLatestDeviceData(data);
+    }
+
+    private void ReplaceLatestDeviceData(IEnumerable<KeyValuePair<string, float>> data)
     {
         latestDeviceData.Clear();
         if (data == null)
@@ -339,21 +350,35 @@ public class ARDetectorHud : MonoBehaviour
             .Append(EscapeRichText(serverStatus))
             .Append("</color>");
 
-        sortedDeviceIds.Clear();
-        foreach (string detectorId in latestDeviceData.Keys)
-            sortedDeviceIds.Add(detectorId);
-        sortedDeviceIds.Sort(StringComparer.OrdinalIgnoreCase);
+        BuildDisplayDetectorIndex();
 
-        if (sortedDeviceIds.Count == 0)
+        if (sortedDisplayDetectorIds.Count == 0)
         {
             textBuilder.Append("\n<color=#B8B8B8>Waiting for detector data...</color>");
         }
         else
         {
-            for (int i = 0; i < sortedDeviceIds.Count; i++)
+            textBuilder.Append("\n<color=#A8A8A8><b>DETECTOR   CPS   DISTANCE</b></color>");
+            Vector3 glassesPosition = targetCamera.transform.position;
+            int selectedDisplayIndex = FindDisplayDetectorIndex(selectedId);
+            int rowLimit = maxVisibleDetectorRows > 0 ? maxVisibleDetectorRows : 9;
+            int visibleRowCount = Mathf.Min(
+                sortedDisplayDetectorIds.Count,
+                rowLimit);
+
+            for (int rowIndex = 0; rowIndex < visibleRowCount; rowIndex++)
             {
-                string detectorId = sortedDeviceIds[i];
+                int displayIndex = rowIndex;
+                if (rowIndex == visibleRowCount - 1 && selectedDisplayIndex >= visibleRowCount)
+                    displayIndex = selectedDisplayIndex;
+
+                string detectorId = sortedDisplayDetectorIds[displayIndex];
                 bool selected = string.Equals(detectorId, selectedId, StringComparison.OrdinalIgnoreCase);
+                bool hasPlacedMarker =
+                    markerIndexByDetectorId.TryGetValue(detectorId, out int markerIndex);
+                DetectorWorldMarkerManager.DetectorHudMarkerState markerState = hasPlacedMarker
+                    ? markerStates[markerIndex]
+                    : default;
 
                 textBuilder.Append("\n");
                 if (selected)
@@ -367,34 +392,129 @@ public class ARDetectorHud : MonoBehaviour
                     textBuilder.Append("<color=#E0E0E0>  ");
                 }
 
-                textBuilder.Append(EscapeRichText(detectorId))
-                    .Append("   ")
-                    .Append(latestDeviceData[detectorId].ToString("F3"));
+                textBuilder.Append(EscapeRichText(detectorId)).Append("   ");
+
+                bool hasRadiation =
+                    latestDeviceData.TryGetValue(detectorId, out float radiationValue) &&
+                    radiationValue >= 0f &&
+                    IsFinite(radiationValue);
+
+                if (hasRadiation)
+                    textBuilder.Append(radiationValue.ToString("F3"));
+                else
+                    textBuilder.Append("--");
 
                 if (!string.IsNullOrWhiteSpace(radiationUnit))
                     textBuilder.Append(" ").Append(EscapeRichText(radiationUnit));
 
+                textBuilder.Append("   ");
+
+                if (hasPlacedMarker)
+                {
+                    float distanceMeters = Vector3.Distance(glassesPosition, markerState.worldPosition);
+                    if (IsFinite(distanceMeters))
+                    {
+                        textBuilder.Append(distanceMeters.ToString("F2"));
+                        textBuilder.Append(" ").Append(EscapeRichText(GetDistanceUnit()));
+                    }
+                    else
+                    {
+                        textBuilder.Append("--");
+                    }
+                }
+                else
+                {
+                    // The server can report a detector before its sphere is placed.
+                    // There is no world coordinate from which to calculate a distance yet.
+                    textBuilder.Append("--");
+                }
+
                 textBuilder.Append(selected ? "</b></color>" : "</color>");
+            }
+
+            int hiddenRowCount = sortedDisplayDetectorIds.Count - visibleRowCount;
+            if (hiddenRowCount > 0)
+            {
+                textBuilder.Append("\n<color=#909090>+")
+                    .Append(hiddenRowCount)
+                    .Append(" more detector")
+                    .Append(hiddenRowCount == 1 ? "" : "s")
+                    .Append("</color>");
             }
         }
 
-        // A placed marker can still be looked at before its serial appears in the latest server packet.
-        if (!string.IsNullOrEmpty(selectedId) && !latestDeviceData.ContainsKey(selectedId))
+        hudText.text = textBuilder.ToString();
+    }
+
+    private void BuildDisplayDetectorIndex()
+    {
+        markerIndexByDetectorId.Clear();
+        displayDetectorIdSet.Clear();
+        sortedDisplayDetectorIds.Clear();
+
+        // Add placed markers first so their canonical/display casing wins when the
+        // server sends the same ID with different casing.
+        for (int i = 0; i < markerStates.Count; i++)
         {
-            float value = markerStates[selectedMarkerIndex].radiationValue;
-            textBuilder.Append("\n<color=#")
-                .Append(ColorUtility.ToHtmlStringRGB(selectedColor))
-                .Append("><b>> ")
-                .Append(EscapeRichText(selectedId))
-                .Append(value >= 0f ? $"   {value:F3}" : "   --");
+            string detectorId = NormalizeDetectorId(markerStates[i].detectorId);
+            if (string.IsNullOrEmpty(detectorId))
+                continue;
 
-            if (!string.IsNullOrWhiteSpace(radiationUnit))
-                textBuilder.Append(" ").Append(EscapeRichText(radiationUnit));
-
-            textBuilder.Append("</b></color>");
+            markerIndexByDetectorId[detectorId] = i;
+            if (displayDetectorIdSet.Add(detectorId))
+                sortedDisplayDetectorIds.Add(detectorId);
         }
 
-        hudText.text = textBuilder.ToString();
+        int placedDetectorCount = sortedDisplayDetectorIds.Count;
+
+        foreach (string detectorId in latestDeviceData.Keys)
+        {
+            if (displayDetectorIdSet.Add(detectorId))
+                sortedDisplayDetectorIds.Add(detectorId);
+        }
+
+        // Keep every placed detector ahead of server-only rows so finite HUD space
+        // is used for entries that can actually show a glasses distance.
+        if (placedDetectorCount > 1)
+            sortedDisplayDetectorIds.Sort(0, placedDetectorCount, StringComparer.OrdinalIgnoreCase);
+
+        int serverOnlyDetectorCount = sortedDisplayDetectorIds.Count - placedDetectorCount;
+        if (serverOnlyDetectorCount > 1)
+        {
+            sortedDisplayDetectorIds.Sort(
+                placedDetectorCount,
+                serverOnlyDetectorCount,
+                StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private int FindDisplayDetectorIndex(string detectorId)
+    {
+        if (string.IsNullOrEmpty(detectorId))
+            return -1;
+
+        for (int i = 0; i < sortedDisplayDetectorIds.Count; i++)
+        {
+            if (string.Equals(sortedDisplayDetectorIds[i], detectorId, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+
+        return -1;
+    }
+
+    private string NormalizeDetectorId(string detectorId)
+    {
+        return string.IsNullOrWhiteSpace(detectorId) ? "" : detectorId.Trim();
+    }
+
+    private bool IsFinite(float value)
+    {
+        return !float.IsNaN(value) && !float.IsInfinity(value);
+    }
+
+    private string GetDistanceUnit()
+    {
+        return string.IsNullOrWhiteSpace(distanceUnit) ? "m" : distanceUnit;
     }
 
     private void UpdateOffscreenIndicators()
@@ -509,6 +629,8 @@ public class ARDetectorHud : MonoBehaviour
     {
         RectTransform rect = indicator.rectTransform;
         float stackOffset = AlternatingStackOffset(stackIndex, 0.055f);
+        float rightIndicatorMinimumY = GetHudAvoidanceTop();
+        float bottomIndicatorMaximumX = GetHudAvoidanceLeft();
         Vector2 anchor;
 
         switch (state.direction)
@@ -525,7 +647,10 @@ public class ARDetectorHud : MonoBehaviour
             case CardinalDirection.Right:
                 anchor = new Vector2(
                     1f - screenEdgeMargin,
-                    Mathf.Clamp(state.viewport.z > 0f ? state.viewport.y + stackOffset : 0.5f + stackOffset, 0.38f, 0.85f));
+                    Mathf.Clamp(
+                        state.viewport.z > 0f ? state.viewport.y + stackOffset : 0.5f + stackOffset,
+                        rightIndicatorMinimumY,
+                        0.85f));
                 rect.pivot = new Vector2(1f, 0.5f);
                 indicator.alignment = TextAlignmentOptions.MidlineRight;
                 indicator.text = $"{state.marker.detectorId}  >";
@@ -542,7 +667,10 @@ public class ARDetectorHud : MonoBehaviour
 
             default:
                 anchor = new Vector2(
-                    Mathf.Clamp(state.viewport.z > 0f ? state.viewport.x + stackOffset : 0.5f + stackOffset, 0.15f, 0.62f),
+                    Mathf.Clamp(
+                        state.viewport.z > 0f ? state.viewport.x + stackOffset : 0.5f + stackOffset,
+                        0.15f,
+                        bottomIndicatorMaximumX),
                     screenEdgeMargin);
                 rect.pivot = new Vector2(0.5f, 0f);
                 indicator.alignment = TextAlignmentOptions.Bottom;
@@ -554,6 +682,18 @@ public class ARDetectorHud : MonoBehaviour
         rect.anchorMax = anchor;
         rect.anchoredPosition = Vector2.zero;
         indicator.color = state.marker.color;
+    }
+
+    private float GetHudAvoidanceTop()
+    {
+        float hudTop = hudViewportAnchor.y + hudPixelSize.y / ReferenceHeight;
+        return Mathf.Clamp(hudTop + 0.02f, 0.15f, 0.85f);
+    }
+
+    private float GetHudAvoidanceLeft()
+    {
+        float hudLeft = hudViewportAnchor.x - hudPixelSize.x / ReferenceWidth;
+        return Mathf.Clamp(hudLeft - 0.02f, 0.15f, 0.85f);
     }
 
     private float AlternatingStackOffset(int index, float step)

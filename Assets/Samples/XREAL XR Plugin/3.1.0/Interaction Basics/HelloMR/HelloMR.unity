@@ -814,7 +814,7 @@ MonoBehaviour:
   waitingForPlaneStateLabel: aim at a detected plane
   useCoordinateDatabase: 1
   coordinateDatabase: {fileID: 906282734}
-  loadSavedCoordinatesOnStart: 0
+  loadSavedCoordinatesOnStart: 1
   useSpatialAnchors: 0
   spatialAnchorManager: {fileID: 0}
   createSpatialAnchorOnQr: 0
@@ -838,7 +838,11 @@ MonoBehaviour:
   smoothPositionOnRescan: 0
   rescanPositionBlend: 0.55
   fixedMarkerSize: 0.2
-  markerAlpha: 0.35
+  markerAlpha: 0.9
+  globeLongitudeLines: 12
+  globeLatitudeLines: 6
+  globeGridLineWidth: 0.04
+  globeRimWidth: 0.18
   forceDedicatedTransparentShader: 1
   showLabel: 0
   showDistanceInLabel: 1
@@ -850,8 +854,7 @@ MonoBehaviour:
   labelFontSize: 4.5
   labelOutlineWidth: 0.2
   labelOutlineColor: {r: 0, g: 0, b: 0, a: 1}
-  safeMax: 0.3
-  warningMax: 1
+  dangerThresholdCps: 350
 --- !u!4 &588933900
 Transform:
   m_ObjectHideFlags: 0
@@ -886,7 +889,7 @@ MonoBehaviour:
   hudViewportAnchor: {x: 0.94, y: 0.06}
   hudPixelSize: {x: 720, y: 430}
   hudFontSize: 27
-  radiationUnit: uSv/h
+  radiationUnit: CPS
   gazeSelectionAngleDegrees: 8
   screenEdgeMargin: 0.05
   indicatorFontSize: 28

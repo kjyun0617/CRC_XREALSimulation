@@ -1,3 +1,4 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using TMPro;
@@ -31,6 +32,7 @@ public class QRScanner : MonoBehaviour
         float qrPixelSize
     );
     public static event FNotifyDetectorDetailedSignature OnQRDetectedDetailed;
+    public static event Action OnScanStarted;
 
     [Header("UI")]
     [SerializeField] private RawImage cameraPreview;
@@ -61,9 +63,12 @@ public class QRScanner : MonoBehaviour
     public float LastQrPixelSize { get; private set; }
     public int LastImageWidth { get; private set; }
     public int LastImageHeight { get; private set; }
+    public bool IsScanActive => isStarting || isScanning;
 
     private WebCamTexture camTexture;
+    private Coroutine startCoroutine;
     private Coroutine scanCoroutine;
+    private int scanSessionId;
     private bool isStarting;
     private bool isScanning;
     private bool hasHandledCurrentResult;
@@ -89,13 +94,22 @@ public class QRScanner : MonoBehaviour
 
         SetStatusVisible(true);
         hasHandledCurrentResult = false;
-        StartCoroutine(RequestPermissionAndStartCamera());
+        int sessionId = ++scanSessionId;
+        OnScanStarted?.Invoke();
+        startCoroutine = StartCoroutine(RequestPermissionAndStartCamera(sessionId));
     }
 
     public void StopScanning()
     {
+        scanSessionId++;
         isStarting = false;
         isScanning = false;
+
+        if (startCoroutine != null)
+        {
+            StopCoroutine(startCoroutine);
+            startCoroutine = null;
+        }
 
         if (scanCoroutine != null)
         {
@@ -123,7 +137,7 @@ public class QRScanner : MonoBehaviour
             cameraPreview.texture = null;
     }
 
-    private IEnumerator RequestPermissionAndStartCamera()
+    private IEnumerator RequestPermissionAndStartCamera(int sessionId)
     {
         isStarting = true;
         UpdateStatus("Requesting camera permission...");
@@ -134,7 +148,9 @@ public class QRScanner : MonoBehaviour
             Permission.RequestUserPermission(Permission.Camera);
 
             float permissionWaitTime = 0f;
-            while (!Permission.HasUserAuthorizedPermission(Permission.Camera) && permissionWaitTime < 10f)
+            while (IsCurrentScanSession(sessionId) &&
+                   !Permission.HasUserAuthorizedPermission(Permission.Camera) &&
+                   permissionWaitTime < 10f)
             {
                 permissionWaitTime += Time.deltaTime;
                 yield return null;
@@ -142,27 +158,38 @@ public class QRScanner : MonoBehaviour
         }
 #endif
 
+        if (!IsCurrentScanSession(sessionId))
+            yield break;
+
         yield return Application.RequestUserAuthorization(UserAuthorization.WebCam);
+
+        if (!IsCurrentScanSession(sessionId))
+            yield break;
 
         if (!Application.HasUserAuthorization(UserAuthorization.WebCam))
         {
             isStarting = false;
+            startCoroutine = null;
             UpdateStatus("Camera permission denied");
             Debug.LogError("Camera permission denied.");
             SetStatusVisible(false);
             yield break;
         }
 
-        yield return StartCoroutine(StartCamera());
+        yield return StartCamera(sessionId);
     }
 
-    private IEnumerator StartCamera()
+    private IEnumerator StartCamera(int sessionId)
     {
+        if (!IsCurrentScanSession(sessionId))
+            yield break;
+
         WebCamDevice[] devices = WebCamTexture.devices;
 
         if (devices == null || devices.Length == 0)
         {
             isStarting = false;
+            startCoroutine = null;
             UpdateStatus("No camera found");
             Debug.LogError("No WebCamTexture camera found.");
             SetStatusVisible(false);
@@ -182,32 +209,45 @@ public class QRScanner : MonoBehaviour
             }
         }
 
-        camTexture = new WebCamTexture(selectedDevice.name, requestedWidth, requestedHeight, requestedFPS);
-        camTexture.Play();
+        WebCamTexture sessionTexture =
+            new WebCamTexture(selectedDevice.name, requestedWidth, requestedHeight, requestedFPS);
+        camTexture = sessionTexture;
+        sessionTexture.Play();
 
         float waitTime = 0f;
-        while (camTexture.width <= 16 && waitTime < 3f)
+        while (IsCurrentScanSession(sessionId) &&
+               sessionTexture != null &&
+               sessionTexture.width <= 16 &&
+               waitTime < 3f)
         {
             waitTime += Time.deltaTime;
             yield return null;
         }
 
-        if (camTexture.width <= 16)
+        if (!IsCurrentScanSession(sessionId))
+        {
+            StopCameraForSession(sessionTexture);
+            yield break;
+        }
+
+        if (sessionTexture == null || sessionTexture.width <= 16)
         {
             isStarting = false;
+            startCoroutine = null;
             UpdateStatus("Camera failed to start");
             Debug.LogError("Camera failed to start.");
-            StopScanning();
+            StopCameraNow();
+            SetPreviewVisible(false);
             SetStatusVisible(false);
             yield break;
         }
 
         if (cameraPreview != null)
         {
-            cameraPreview.texture = camTexture;
-            cameraPreview.rectTransform.localEulerAngles = new Vector3(0f, 0f, -camTexture.videoRotationAngle);
+            cameraPreview.texture = sessionTexture;
+            cameraPreview.rectTransform.localEulerAngles = new Vector3(0f, 0f, -sessionTexture.videoRotationAngle);
 
-            if (camTexture.videoVerticallyMirrored)
+            if (sessionTexture.videoVerticallyMirrored)
                 cameraPreview.uvRect = new Rect(0f, 1f, 1f, -1f);
             else
                 cameraPreview.uvRect = new Rect(0f, 0f, 1f, 1f);
@@ -217,10 +257,33 @@ public class QRScanner : MonoBehaviour
 
         isStarting = false;
         isScanning = true;
+        startCoroutine = null;
         scanCoroutine = StartCoroutine(ScanLoop());
 
         UpdateStatus($"Camera on: {selectedDevice.name}\nPoint camera at QR code");
-        Debug.Log($"QR camera started: {selectedDevice.name}, size={camTexture.width}x{camTexture.height}");
+        Debug.Log($"QR camera started: {selectedDevice.name}, size={sessionTexture.width}x{sessionTexture.height}");
+    }
+
+    private bool IsCurrentScanSession(int sessionId)
+    {
+        return sessionId == scanSessionId;
+    }
+
+    private void StopCameraForSession(WebCamTexture sessionTexture)
+    {
+        if (sessionTexture == null)
+            return;
+
+        if (sessionTexture.isPlaying)
+            sessionTexture.Stop();
+
+        if (cameraPreview != null && cameraPreview.texture == sessionTexture)
+            cameraPreview.texture = null;
+
+        if (camTexture == sessionTexture)
+            camTexture = null;
+
+        Destroy(sessionTexture);
     }
 
     private IEnumerator ScanLoop()
@@ -300,7 +363,8 @@ public class QRScanner : MonoBehaviour
         LastImageWidth = imageWidth;
         LastImageHeight = imageHeight;
 
-        bool alreadyScanned = detectorNameList.Contains(qrText);
+        bool alreadyScanned = detectorNameList.Exists(
+            value => string.Equals(value, qrText, StringComparison.OrdinalIgnoreCase));
         if (rememberScannedQrTexts && !alreadyScanned)
             detectorNameList.Add(qrText);
 
