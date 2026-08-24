@@ -844,9 +844,10 @@ MonoBehaviour:
   fixedMarkerSize: 0.2
   markerAlpha: 0.9
   responseSurfaceBrightness: 0.12
-  responseContourBands: 3
-  responseContourLineWidth: 0.012
-  responseSilhouetteWidth: 0.045
+  responsePrimaryBandWidth: 0.012
+  responseCalibrationBandWidth: 0.006
+  responseCalibrationBandBrightness: 0.62
+  responseSilhouetteWidth: 0.032
   forceDedicatedTransparentShader: 1
   showLabel: 0
   showDistanceInLabel: 1

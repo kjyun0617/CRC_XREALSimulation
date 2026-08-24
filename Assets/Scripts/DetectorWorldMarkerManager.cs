@@ -122,14 +122,17 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [Tooltip("Brightness of the subdued sphere shell between measurement contours.")]
     [SerializeField, Range(0.02f, 0.35f)] private float responseSurfaceBrightness = 0.12f;
 
-    [Tooltip("Number of rotation-invariant iso-response contour bands.")]
-    [SerializeField, Range(2, 6)] private int responseContourBands = 3;
+    [Tooltip("Half-width of the main response band aligned with the detected placement plane.")]
+    [SerializeField, Range(0.003f, 0.05f)] private float responsePrimaryBandWidth = 0.012f;
 
-    [Tooltip("Half-width of each projected-radius contour line.")]
-    [SerializeField, Range(0.003f, 0.05f)] private float responseContourLineWidth = 0.012f;
+    [Tooltip("Half-width of the thinner parallel calibration bands.")]
+    [SerializeField, Range(0.002f, 0.04f)] private float responseCalibrationBandWidth = 0.006f;
+
+    [Tooltip("Brightness of the calibration bands relative to the main placement-plane band.")]
+    [SerializeField, Range(0.1f, 1f)] private float responseCalibrationBandBrightness = 0.62f;
 
     [Tooltip("Width of the thin silhouette line used to read the response-volume diameter.")]
-    [SerializeField, Range(0.01f, 0.15f)] private float responseSilhouetteWidth = 0.045f;
+    [SerializeField, Range(0.01f, 0.15f)] private float responseSilhouetteWidth = 0.032f;
 
     [Tooltip("Use the included RadVis response-contour shader for consistent XREAL rendering.")]
     [SerializeField] private bool forceDedicatedTransparentShader = true;
@@ -753,7 +756,10 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             activePlacementSession = null;
         }
 
-        Quaternion worldRotation = CalculateMarkerRotation(marker.savedPosition);
+        // Preserve the AR plane orientation captured by the placement preview.
+        // Local Y remains the plane normal, so the detector pattern does not turn
+        // toward the viewer after it has been placed.
+        Quaternion worldRotation = marker.root.transform.rotation;
         string placementMethod = string.IsNullOrEmpty(marker.lastPlacementMethod)
             ? "PreviewCenterButtonPlaced"
             : marker.lastPlacementMethod + "+ButtonPlaced";
@@ -1196,8 +1202,16 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         marker.isFollowingPlacementOrigin = false;
         marker.isPlaced = true;
 
-        if (parentMarkerToAnchor && anchor != null && marker.root != null)
-            marker.root.transform.SetParent(anchor.transform, true);
+        if (marker.root != null)
+        {
+            marker.root.transform.SetPositionAndRotation(anchor.transform.position, anchor.transform.rotation);
+            if (parentMarkerToAnchor)
+            {
+                marker.root.transform.SetParent(anchor.transform, false);
+                marker.root.transform.localPosition = Vector3.zero;
+                marker.root.transform.localRotation = Quaternion.identity;
+            }
+        }
 
         UpdateMarkerVisual(marker, marker.lastRadiationValue);
         Debug.Log($"[DetectorWorldMarkerManager] Anchor created and saved: {detectorId}, {persistentGuid}");
@@ -1226,8 +1240,16 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         marker.isFollowingPlacementOrigin = false;
         marker.isPlaced = true;
 
-        if (parentMarkerToAnchor && marker.root != null)
-            marker.root.transform.SetParent(anchor.transform, true);
+        if (marker.root != null)
+        {
+            marker.root.transform.SetPositionAndRotation(anchor.transform.position, anchor.transform.rotation);
+            if (parentMarkerToAnchor)
+            {
+                marker.root.transform.SetParent(anchor.transform, false);
+                marker.root.transform.localPosition = Vector3.zero;
+                marker.root.transform.localRotation = Quaternion.identity;
+            }
+        }
 
         if (coordinateDatabase != null && coordinateDatabase.TryGetRecord(detectorId, out DetectorCoordinateRecord record) && record.lastRadiationValue >= 0f)
             UpdateMarkerVisual(marker, record.lastRadiationValue);
@@ -1603,11 +1625,14 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (material.HasProperty("_SurfaceBrightness"))
             material.SetFloat("_SurfaceBrightness", responseSurfaceBrightness);
 
-        if (material.HasProperty("_ContourBands"))
-            material.SetFloat("_ContourBands", responseContourBands);
+        if (material.HasProperty("_PrimaryBandWidth"))
+            material.SetFloat("_PrimaryBandWidth", responsePrimaryBandWidth);
 
-        if (material.HasProperty("_ContourLineWidth"))
-            material.SetFloat("_ContourLineWidth", responseContourLineWidth);
+        if (material.HasProperty("_CalibrationBandWidth"))
+            material.SetFloat("_CalibrationBandWidth", responseCalibrationBandWidth);
+
+        if (material.HasProperty("_CalibrationBandBrightness"))
+            material.SetFloat("_CalibrationBandBrightness", responseCalibrationBandBrightness);
 
         if (material.HasProperty("_RimWidth"))
             material.SetFloat("_RimWidth", responseSilhouetteWidth);
@@ -1750,6 +1775,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
                 if (marker != null)
                 {
+                    marker.root.transform.rotation = record.GetRotation();
                     marker.anchorState = record.placementMethod;
                     marker.isFollowingPlacementOrigin = false;
                     marker.isPlaced = true;
