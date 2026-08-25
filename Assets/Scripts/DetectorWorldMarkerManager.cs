@@ -9,7 +9,7 @@ using UnityEngine.XR.ARSubsystems;
 /// Preview-center detector placement flow.
 /// QR scan selects detectorId, then marker preview follows the glasses/camera center
 /// until PlaceDetector() is called. The placed marker keeps the same fixed size and
-/// updates color by radiation value with a softly filled response-volume material.
+/// updates the center color by CPS and draws faint inverse-square falloff shells.
 /// </summary>
 public class DetectorWorldMarkerManager : MonoBehaviour
 {
@@ -116,26 +116,27 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [Tooltip("Fixed world scale of every detector sphere. Radiation value changes color only, not size.")]
     [SerializeField] private float fixedMarkerSize = 0.20f;
 
-    [Tooltip("Brightness of the response contours. The shell uses a separate, dimmer brightness.")]
-    [SerializeField, Range(0.25f, 1.0f)] private float markerAlpha = 0.90f;
+    [Tooltip("Opacity of the line-free center detector sphere.")]
+    [SerializeField, Range(0.02f, 0.8f)] private float markerAlpha = 0.18f;
 
-    [Tooltip("Brightness of the subdued sphere shell between measurement contours.")]
-    [SerializeField, Range(0.02f, 0.35f)] private float responseSurfaceBrightness = 0.12f;
-
-    [Tooltip("Half-width of the main response band aligned with the detected placement plane.")]
-    [SerializeField, Range(0.003f, 0.05f)] private float responsePrimaryBandWidth = 0.012f;
-
-    [Tooltip("Half-width of the thinner parallel calibration bands.")]
-    [SerializeField, Range(0.002f, 0.04f)] private float responseCalibrationBandWidth = 0.006f;
-
-    [Tooltip("Brightness of the calibration bands relative to the main placement-plane band.")]
-    [SerializeField, Range(0.1f, 1f)] private float responseCalibrationBandBrightness = 0.62f;
-
-    [Tooltip("Width of the thin silhouette line used to read the response-volume diameter.")]
-    [SerializeField, Range(0.01f, 0.15f)] private float responseSilhouetteWidth = 0.032f;
-
-    [Tooltip("Use the included RadVis response-contour shader for consistent XREAL rendering.")]
+    [Tooltip("Use the included line-free transparent volume shader for consistent XREAL rendering.")]
     [SerializeField] private bool forceDedicatedTransparentShader = true;
+
+    [Header("Inverse-Square Falloff Visualization")]
+    [Tooltip("Show very faint inverse-square approach zones. This is a relative visual guide; source geometry, shielding, and detector calibration still determine the real safe distance.")]
+    [SerializeField] private bool showFalloffShells = true;
+
+    [Tooltip("Calibrated reference distance for I(r) = I0 * (reference/r)^2. At 8 cm, a 351 CPS reading produces roughly 0.47 m yellow and 1.06 m green boundaries.")]
+    [SerializeField, Min(0.01f)] private float falloffReferenceDistanceMeters = 0.08f;
+
+    [Tooltip("Maximum radius visualized around one detector.")]
+    [SerializeField, Min(0.5f)] private float falloffMaxRadiusMeters = 5.0f;
+
+    [Tooltip("Opacity of outer falloff spheres. Keep this very low so they do not obstruct the glasses view.")]
+    [SerializeField, Range(0.002f, 0.12f)] private float falloffShellAlpha = 0.012f;
+
+    [Tooltip("Maximum number of transition/boundary shells per detector.")]
+    [SerializeField, Range(1, 3)] private int maxFalloffShells = 3;
 
     [SerializeField] private bool showLabel = false;
     [SerializeField] private bool showDistanceInLabel = true;
@@ -160,6 +161,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField] private Color labelOutlineColor = Color.black;
 
     [Header("Radiation Thresholds")]
+    [Tooltip("CPS values at or below this value hide the center sphere completely.")]
+    [SerializeField, Min(0f)] private float hiddenMaxCps = 2f;
+
+    [Tooltip("CPS values above Hidden Max and at or below this value are green.")]
+    [SerializeField, Min(0f)] private float greenMaxCps = 10f;
+
     [Tooltip("CPS values strictly above this value are red. Exactly 350 CPS remains yellow.")]
     [SerializeField, Min(0f)] private float dangerThresholdCps = 350f;
 
@@ -176,6 +183,15 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     private string lastInteractedDetectorId = "";
     private Shader cachedDetectorTransparentShader;
     private bool serverConnected;
+
+    private enum RadiationRiskBand
+    {
+        Unknown,
+        Hidden,
+        Green,
+        Yellow,
+        Red
+    }
 
     private void OnEnable()
     {
@@ -194,6 +210,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         RadiationReceiver.OnRadiationDataReceived -= HandleRadiationDataReceived;
         RadiationReceiver.OnServerConnectionChanged -= HandleServerConnectionChanged;
         UnsubscribeSpatialEvents();
+    }
+
+    private void OnDestroy()
+    {
+        foreach (var pair in markers)
+            DestroyMarkerVisualResources(pair.Value);
     }
 
     public bool HasActivePlacement =>
@@ -495,6 +517,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         markers.Remove(detectorId);
         marker.isFollowingPlacementOrigin = false;
         marker.isPlaced = false;
+        DestroyMarkerVisualResources(marker);
 
         if (marker.root != null)
         {
@@ -949,6 +972,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (coordinateDatabase != null)
             coordinateDatabase.RemoveCoordinate(detectorId);
 
+        DestroyMarkerVisualResources(marker);
         if (marker.root != null)
             Destroy(marker.root);
 
@@ -1251,10 +1275,17 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             }
         }
 
-        if (coordinateDatabase != null && coordinateDatabase.TryGetRecord(detectorId, out DetectorCoordinateRecord record) && record.lastRadiationValue >= 0f)
-            UpdateMarkerVisual(marker, record.lastRadiationValue);
-        else
-            UpdateMarkerVisual(marker, marker.lastRadiationValue);
+        float restoredRadiationValue = marker.lastRadiationValue;
+        if (coordinateDatabase != null &&
+            coordinateDatabase.TryGetRecord(detectorId, out DetectorCoordinateRecord record) &&
+            record.lastRadiationValue >= 0f)
+        {
+            restoredRadiationValue = record.lastRadiationValue;
+        }
+
+        UpdateMarkerVisual(
+            marker,
+            GetLatestRadiationValue(detectorId, restoredRadiationValue));
     }
 
     private void HandleAnchorSaveFailed(string detectorId, string message)
@@ -1349,6 +1380,8 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         {
             if (existing == null || existing.root == null)
             {
+                if (existing != null)
+                    DestroyMarkerVisualResources(existing);
                 markers.Remove(detectorId);
             }
             else
@@ -1404,7 +1437,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             renderer = renderer,
             label = label,
             savedPosition = worldPosition,
-            lastRadiationValue = -1f,
+            lastRadiationValue = GetLatestRadiationValue(detectorId, -1f),
             lastEstimatedDistance = estimatedDistance,
             lastQrPixelSize = qrPixelSize,
             lastPlacementImagePoint = new Vector2(0.5f, 0.5f),
@@ -1413,12 +1446,13 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             lastPlacementMethod = "preview projection",
             isFollowingPlacementOrigin = false,
             isPlaced = false,
+            centerVisualRequested = true,
             anchorState = useSpatialAnchors ? "no anchor yet" : "preview projection"
         };
 
         markers.Add(detectorId, info);
         ForceMarkerVisible(info);
-        UpdateMarkerVisual(info, -1f);
+        UpdateMarkerVisual(info, info.lastRadiationValue);
         return info;
     }
 
@@ -1446,7 +1480,10 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         Collider collider = sphere.GetComponent<Collider>();
         if (collider != null)
+        {
+            collider.enabled = false;
             Destroy(collider);
+        }
 
         return sphere;
     }
@@ -1523,11 +1560,23 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         marker.lastRadiationValue = radiationValue;
 
+        RadiationRiskBand riskBand = GetRiskBand(radiationValue);
         Color color = GetRiskColor(radiationValue);
         color.a = markerAlpha;
-        SetRendererTransparentColor(marker.renderer, color);
+        marker.centerMaterial =
+            SetRendererTransparentColor(marker.renderer, color, 10, false);
 
-        // Radiation value affects color only. Size always stays fixed.
+        // Keep the logical marker root alive so HUD distance, gaze selection,
+        // Cancel, and anchor state continue to work even when 0-2 CPS hides the
+        // center sphere. An unknown preview stays visible for placement; an
+        // already placed detector with no valid reading stays visually quiet.
+        marker.centerVisualRequested =
+            riskBand != RadiationRiskBand.Hidden &&
+            (riskBand != RadiationRiskBand.Unknown || !marker.isPlaced);
+
+        UpdateFalloffShellVisuals(marker, radiationValue, riskBand);
+
+        // Radiation value affects visibility/color only. Center size stays fixed.
         marker.root.transform.localScale = Vector3.one * fixedMarkerSize;
 
         bool waitingForPlaneHit =
@@ -1545,24 +1594,283 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private Color GetRiskColor(float radiationValue)
     {
+        switch (GetRiskBand(radiationValue))
+        {
+            case RadiationRiskBand.Green:
+            case RadiationRiskBand.Hidden:
+                return new Color(0.0f, 1.0f, 0.0f, markerAlpha);
+            case RadiationRiskBand.Yellow:
+                return new Color(1.0f, 1.0f, 0.0f, markerAlpha);
+            case RadiationRiskBand.Red:
+                return new Color(1.0f, 0.0f, 0.0f, markerAlpha);
+            default:
+                return new Color(0.65f, 0.65f, 0.65f, markerAlpha);
+        }
+    }
+
+    private RadiationRiskBand GetRiskBand(float radiationValue)
+    {
         if (float.IsNaN(radiationValue) ||
             float.IsInfinity(radiationValue) ||
             radiationValue < 0f)
         {
-            return new Color(0.65f, 0.65f, 0.65f, markerAlpha);
+            return RadiationRiskBand.Unknown;
         }
 
-        // Only an exact zero is green. Although CPS is normally a whole-count
-        // rate, a fractional positive average is conservatively kept yellow.
-        if (radiationValue == 0f)
-            return new Color(0.0f, 1.0f, 0.0f, markerAlpha);
+        float hiddenThreshold = Mathf.Max(0f, hiddenMaxCps);
+        float greenThreshold = Mathf.Max(hiddenThreshold, greenMaxCps);
+        float redThreshold = Mathf.Max(greenThreshold, dangerThresholdCps);
 
-        float redThreshold = Mathf.Max(0f, dangerThresholdCps);
+        if (radiationValue <= hiddenThreshold)
+            return RadiationRiskBand.Hidden;
+        if (radiationValue <= greenThreshold)
+            return RadiationRiskBand.Green;
+        if (radiationValue <= redThreshold)
+            return RadiationRiskBand.Yellow;
+        return RadiationRiskBand.Red;
+    }
 
-        if (radiationValue > redThreshold)
-            return new Color(1.0f, 0.0f, 0.0f, markerAlpha);
+    private void UpdateFalloffShellVisuals(
+        MarkerInfo marker,
+        float centerCps,
+        RadiationRiskBand centerBand)
+    {
+        HideFalloffShells(marker);
 
-        return new Color(1.0f, 1.0f, 0.0f, markerAlpha);
+        if (!showFalloffShells ||
+            marker == null ||
+            !marker.isPlaced ||
+            (centerBand != RadiationRiskBand.Red && centerBand != RadiationRiskBand.Yellow))
+        {
+            return;
+        }
+
+        EnsureFalloffShellPool(marker);
+        if (marker.falloffShells == null || marker.falloffShells.Count == 0)
+            return;
+
+        float referenceDistance = Mathf.Max(0.01f, falloffReferenceDistanceMeters);
+        float centerRadius = Mathf.Max(0.01f, fixedMarkerSize * 0.5f);
+        float maximumRadius = Mathf.Max(centerRadius, falloffMaxRadiusMeters);
+        int availableShells = Mathf.Min(
+            Mathf.Clamp(maxFalloffShells, 1, 3),
+            marker.falloffShells.Count);
+        int shellIndex = 0;
+        float lastConfiguredRadius = centerRadius;
+
+        float hiddenThreshold = Mathf.Max(0.001f, hiddenMaxCps);
+        float greenThreshold = Mathf.Max(hiddenThreshold, greenMaxCps);
+        float redThreshold = Mathf.Max(greenThreshold, dangerThresholdCps);
+        float redBoundaryRadius =
+            referenceDistance * Mathf.Sqrt(centerCps / redThreshold);
+        float yellowBoundaryRadius =
+            referenceDistance * Mathf.Sqrt(centerCps / greenThreshold);
+        float greenBoundaryRadius =
+            referenceDistance * Mathf.Sqrt(centerCps / hiddenThreshold);
+
+        // Each shell marks the outer edge of the like-colored approach zone.
+        // A barely-red reading keeps its red boundary inside the fixed center;
+        // a much stronger reading expands that red zone correctly.
+        if (centerBand == RadiationRiskBand.Red)
+        {
+            TryConfigureFalloffBoundary(
+                marker,
+                ref shellIndex,
+                ref lastConfiguredRadius,
+                availableShells,
+                redBoundaryRadius,
+                maximumRadius,
+                RadiationRiskBand.Red);
+        }
+
+        TryConfigureFalloffBoundary(
+            marker,
+            ref shellIndex,
+            ref lastConfiguredRadius,
+            availableShells,
+            yellowBoundaryRadius,
+            maximumRadius,
+            RadiationRiskBand.Yellow);
+
+        TryConfigureFalloffBoundary(
+            marker,
+            ref shellIndex,
+            ref lastConfiguredRadius,
+            availableShells,
+            greenBoundaryRadius,
+            maximumRadius,
+            RadiationRiskBand.Green);
+
+        // If the true green boundary is beyond the configured view range, show
+        // the actually estimated band at the endpoint instead of a false safe
+        // boundary. This is most relevant for exceptionally high readings.
+        if (greenBoundaryRadius > maximumRadius && shellIndex < availableShells)
+        {
+            float ratio = referenceDistance / Mathf.Max(maximumRadius, referenceDistance);
+            RadiationRiskBand endpointBand = GetRiskBand(centerCps * ratio * ratio);
+            TryConfigureFalloffBoundary(
+                marker,
+                ref shellIndex,
+                ref lastConfiguredRadius,
+                availableShells,
+                maximumRadius,
+                maximumRadius,
+                endpointBand);
+        }
+    }
+
+    private bool TryConfigureFalloffBoundary(
+        MarkerInfo marker,
+        ref int shellIndex,
+        ref float lastConfiguredRadius,
+        int availableShells,
+        float radiusMeters,
+        float maximumRadius,
+        RadiationRiskBand band)
+    {
+        if (shellIndex >= availableShells ||
+            radiusMeters > maximumRadius ||
+            radiusMeters <= lastConfiguredRadius * 1.05f ||
+            band == RadiationRiskBand.Hidden ||
+            band == RadiationRiskBand.Unknown)
+        {
+            return false;
+        }
+
+        ConfigureFalloffShell(marker, shellIndex, radiusMeters, band);
+        shellIndex++;
+        lastConfiguredRadius = radiusMeters;
+        return true;
+    }
+
+    private void EnsureFalloffShellPool(MarkerInfo marker)
+    {
+        if (marker == null || marker.root == null)
+            return;
+
+        if (marker.falloffShells == null)
+            marker.falloffShells = new List<FalloffShellInfo>();
+
+        int desiredCount = Mathf.Clamp(maxFalloffShells, 1, 3);
+        while (marker.falloffShells.Count < desiredCount)
+        {
+            int shellIndex = marker.falloffShells.Count;
+            GameObject shellObject = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            shellObject.name = $"FalloffShell_{shellIndex + 1}";
+            shellObject.layer = marker.root.layer;
+            shellObject.transform.SetParent(marker.root.transform, false);
+            shellObject.transform.localPosition = Vector3.zero;
+            shellObject.transform.localRotation = Quaternion.identity;
+            shellObject.transform.localScale = Vector3.one;
+
+            Collider collider = shellObject.GetComponent<Collider>();
+            if (collider != null)
+            {
+                collider.enabled = false;
+                Destroy(collider);
+            }
+
+            Renderer shellRenderer = shellObject.GetComponent<Renderer>();
+            Material shellMaterial = null;
+            if (shellRenderer != null)
+            {
+                Shader shader = GetDetectorTransparentShader();
+                if (shader == null)
+                    shader = Shader.Find("Universal Render Pipeline/Lit");
+                if (shader == null)
+                    shader = Shader.Find("Standard");
+                if (shader != null)
+                {
+                    shellMaterial = new Material(shader);
+                    shellRenderer.material = shellMaterial;
+                }
+
+                shellRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                shellRenderer.receiveShadows = false;
+                shellRenderer.enabled = false;
+            }
+
+            marker.falloffShells.Add(new FalloffShellInfo
+            {
+                root = shellObject,
+                renderer = shellRenderer,
+                visualRequested = false,
+                material = shellMaterial
+            });
+        }
+    }
+
+    private void ConfigureFalloffShell(
+        MarkerInfo marker,
+        int shellIndex,
+        float radiusMeters,
+        RadiationRiskBand band)
+    {
+        if (marker == null ||
+            marker.falloffShells == null ||
+            shellIndex < 0 ||
+            shellIndex >= marker.falloffShells.Count)
+        {
+            return;
+        }
+
+        FalloffShellInfo shell = marker.falloffShells[shellIndex];
+        if (shell == null || shell.root == null)
+            return;
+
+        float centerDiameter = Mathf.Max(0.001f, fixedMarkerSize);
+        shell.root.transform.localPosition = Vector3.zero;
+        shell.root.transform.localRotation = Quaternion.identity;
+        shell.root.transform.localScale =
+            Vector3.one * ((radiusMeters * 2f) / centerDiameter);
+
+        Color color = GetRiskColorForBand(band);
+        color.a = falloffShellAlpha;
+
+        // Inner shells render after outer shells; the center sphere renders last.
+        int queueOffset = Mathf.Clamp(maxFalloffShells, 1, 3) - shellIndex;
+        shell.material =
+            SetRendererTransparentColor(shell.renderer, color, queueOffset, true);
+        shell.visualRequested = true;
+    }
+
+    private Color GetRiskColorForBand(RadiationRiskBand band)
+    {
+        switch (band)
+        {
+            case RadiationRiskBand.Red:
+                return Color.red;
+            case RadiationRiskBand.Yellow:
+                return Color.yellow;
+            default:
+                return Color.green;
+        }
+    }
+
+    private float GetLatestRadiationValue(string detectorId, float fallbackValue)
+    {
+        detectorId = NormalizeDetectorId(detectorId);
+        if (radiationReceiver != null &&
+            radiationReceiver.LatestDeviceData != null &&
+            radiationReceiver.LatestDeviceData.TryGetValue(detectorId, out float latestValue))
+        {
+            return latestValue;
+        }
+
+        return fallbackValue;
+    }
+
+    private void HideFalloffShells(MarkerInfo marker)
+    {
+        if (marker == null || marker.falloffShells == null)
+            return;
+
+        for (int i = 0; i < marker.falloffShells.Count; i++)
+        {
+            FalloffShellInfo shell = marker.falloffShells[i];
+            if (shell != null)
+                shell.visualRequested = false;
+        }
     }
 
     private void ForceMarkerVisible(MarkerInfo marker)
@@ -1594,16 +1902,30 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             marker.root.SetActive(visible);
 
         if (marker.renderer != null)
-            marker.renderer.enabled = visible;
+            marker.renderer.enabled = visible && marker.centerVisualRequested;
+
+        if (marker.falloffShells != null)
+        {
+            for (int i = 0; i < marker.falloffShells.Count; i++)
+            {
+                FalloffShellInfo shell = marker.falloffShells[i];
+                if (shell != null && shell.renderer != null)
+                    shell.renderer.enabled = visible && shell.visualRequested;
+            }
+        }
 
         if (showLabel && marker.label != null)
             marker.label.gameObject.SetActive(visible);
     }
 
-    private void SetRendererTransparentColor(Renderer renderer, Color color)
+    private Material SetRendererTransparentColor(
+        Renderer renderer,
+        Color color,
+        int renderQueueOffset,
+        bool renderInside)
     {
         if (renderer == null || renderer.material == null)
-            return;
+            return null;
 
         Material material = renderer.material;
 
@@ -1622,20 +1944,44 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (material.HasProperty("_Color"))
             material.SetColor("_Color", color);
 
-        if (material.HasProperty("_SurfaceBrightness"))
-            material.SetFloat("_SurfaceBrightness", responseSurfaceBrightness);
+        if (material.HasProperty("_Cull"))
+        {
+            material.SetFloat(
+                "_Cull",
+                renderInside
+                    ? (float)UnityEngine.Rendering.CullMode.Off
+                    : (float)UnityEngine.Rendering.CullMode.Back);
+        }
 
-        if (material.HasProperty("_PrimaryBandWidth"))
-            material.SetFloat("_PrimaryBandWidth", responsePrimaryBandWidth);
+        material.renderQueue =
+            (int)UnityEngine.Rendering.RenderQueue.Transparent + renderQueueOffset;
 
-        if (material.HasProperty("_CalibrationBandWidth"))
-            material.SetFloat("_CalibrationBandWidth", responseCalibrationBandWidth);
+        return material;
+    }
 
-        if (material.HasProperty("_CalibrationBandBrightness"))
-            material.SetFloat("_CalibrationBandBrightness", responseCalibrationBandBrightness);
+    private void DestroyMarkerVisualResources(MarkerInfo marker)
+    {
+        if (marker == null)
+            return;
 
-        if (material.HasProperty("_RimWidth"))
-            material.SetFloat("_RimWidth", responseSilhouetteWidth);
+        if (marker.centerMaterial != null)
+        {
+            Destroy(marker.centerMaterial);
+            marker.centerMaterial = null;
+        }
+
+        if (marker.falloffShells == null)
+            return;
+
+        for (int i = 0; i < marker.falloffShells.Count; i++)
+        {
+            FalloffShellInfo shell = marker.falloffShells[i];
+            if (shell == null || shell.material == null)
+                continue;
+
+            Destroy(shell.material);
+            shell.material = null;
+        }
     }
 
     private void ConfigureTransparentMaterial(Material material)
@@ -1728,6 +2074,21 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                 imageHeight,
                 placementMethod
             );
+
+            // A server snapshot may have arrived before this detector's first
+            // coordinate record existed. Persist the value used by the marker now
+            // so an app restart does not fall back to an unknown/hidden reading.
+            string normalizedDetectorId = NormalizeDetectorId(detectorId);
+            if (markers.TryGetValue(normalizedDetectorId, out MarkerInfo marker) &&
+                marker != null &&
+                !float.IsNaN(marker.lastRadiationValue) &&
+                !float.IsInfinity(marker.lastRadiationValue) &&
+                marker.lastRadiationValue >= 0f)
+            {
+                coordinateDatabase.UpdateRadiationValue(
+                    normalizedDetectorId,
+                    marker.lastRadiationValue);
+            }
         }
     }
 
@@ -1780,10 +2141,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                     marker.isFollowingPlacementOrigin = false;
                     marker.isPlaced = true;
 
-                    if (record.lastRadiationValue >= 0f)
-                        UpdateMarkerVisual(marker, record.lastRadiationValue);
-                    else
-                        UpdateMarkerVisual(marker, marker.lastRadiationValue);
+                    float restoredRadiationValue = record.lastRadiationValue >= 0f
+                        ? record.lastRadiationValue
+                        : marker.lastRadiationValue;
+                    UpdateMarkerVisual(
+                        marker,
+                        GetLatestRadiationValue(record.detectorId, restoredRadiationValue));
                 }
             }
 
@@ -1818,6 +2181,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         foreach (var kvp in markers)
         {
+            DestroyMarkerVisualResources(kvp.Value);
             if (kvp.Value.root != null)
                 Destroy(kvp.Value.root);
         }
@@ -1931,8 +2295,19 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         public bool isPlaced;
         public bool hasValidPlaneHit;
         public bool visibilityRequested;
+        public bool centerVisualRequested;
+        public List<FalloffShellInfo> falloffShells;
+        public Material centerMaterial;
         public ARAnchor anchor;
         public string anchorGuid;
         public string anchorState;
+    }
+
+    private class FalloffShellInfo
+    {
+        public GameObject root;
+        public Renderer renderer;
+        public bool visualRequested;
+        public Material material;
     }
 }

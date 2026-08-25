@@ -842,13 +842,13 @@ MonoBehaviour:
   smoothPositionOnRescan: 0
   rescanPositionBlend: 0.55
   fixedMarkerSize: 0.2
-  markerAlpha: 0.9
-  responseSurfaceBrightness: 0.12
-  responsePrimaryBandWidth: 0.012
-  responseCalibrationBandWidth: 0.006
-  responseCalibrationBandBrightness: 0.62
-  responseSilhouetteWidth: 0.032
+  markerAlpha: 0.18
   forceDedicatedTransparentShader: 1
+  showFalloffShells: 1
+  falloffReferenceDistanceMeters: 0.08
+  falloffMaxRadiusMeters: 5
+  falloffShellAlpha: 0.012
+  maxFalloffShells: 3
   showLabel: 0
   showDistanceInLabel: 1
   showAnchorStateInLabel: 1
@@ -859,6 +859,8 @@ MonoBehaviour:
   labelFontSize: 4.5
   labelOutlineWidth: 0.2
   labelOutlineColor: {r: 0, g: 0, b: 0, a: 1}
+  hiddenMaxCps: 2
+  greenMaxCps: 10
   dangerThresholdCps: 350
 --- !u!4 &588933900
 Transform:
