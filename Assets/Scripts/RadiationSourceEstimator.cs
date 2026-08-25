@@ -10,6 +10,8 @@ using UnityEngine.Rendering;
 /// The model is lambda_i = background_i + activity * calibration_i / r_i^2.
 /// A coarse-to-fine grid search minimizes Poisson negative log likelihood. Search
 /// work is split across frames so a room-sized grid does not stall the AR view.
+/// A non-collinear planar array uses a 2D best-effort source projection on the
+/// detector plane because the plane-normal side cannot be resolved reliably.
 /// This is a relative localization aid, not a dose or safety certification model.
 /// </summary>
 [DisallowMultipleComponent]
@@ -87,9 +89,10 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
     [SerializeField, Min(0.01f)] private float minimumSourceDistanceMeters = 0.08f;
     [SerializeField, Min(0f)] private float minimumTotalExcessCps = 1f;
     [SerializeField, Min(0f)] private float minimumDetectorSpanMeters = 0.25f;
-    [Tooltip("Reject a detector layout that cannot constrain all three spatial axes. Disable only when configured room bounds deliberately resolve a planar mirror ambiguity.")]
-    [SerializeField] private bool requireNonCoplanarGeometry = true;
-    [SerializeField, Min(0.001f)] private float minimumGeometryThicknessMeters = 0.03f;
+    [Tooltip("Minimum detector spread perpendicular to the longest detector-to-detector line. Smaller layouts are effectively collinear and cannot localize a source.")]
+    [SerializeField, Min(0.001f)] private float minimumNonCollinearOffsetMeters = 0.03f;
+    [Tooltip("Layouts no thicker than this are treated as one detector plane. The 10 cm default tolerates placement/anchor error in a physically wide square.")]
+    [SerializeField, Min(0.01f)] private float maximumPlanarThicknessMeters = 0.10f;
     [SerializeField] private List<DetectorCalibration> detectorCalibrations =
         new List<DetectorCalibration>();
 
@@ -111,6 +114,8 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
     [SerializeField, Range(0.5f, 2f)] private float boundaryMarginInCoarseCells = 0.75f;
     [Tooltip("Minimum improvement over a spatially uniform CPS model before showing the source sphere.")]
     [SerializeField, Range(0f, 1f)] private float minimumFitQuality = 0.05f;
+    [Tooltip("A planar array can have a useful source projection even when improvement over a uniform model is small. Accept that projection only when RMS divided by mean CPS above background is below this value.")]
+    [SerializeField, Range(0.05f, 1f)] private float maximumPlanarRelativeRms = 0.35f;
 
     [Header("Scheduling")]
     [SerializeField, Min(100)] private int candidatesPerFrame = 2000;
@@ -233,6 +238,12 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
     {
         minimumDetectorCount = Mathf.Max(4, minimumDetectorCount);
         minimumSourceDistanceMeters = Mathf.Max(0.01f, minimumSourceDistanceMeters);
+        minimumNonCollinearOffsetMeters = Mathf.Max(
+            0.001f,
+            minimumNonCollinearOffsetMeters);
+        maximumPlanarThicknessMeters = Mathf.Max(
+            minimumNonCollinearOffsetMeters,
+            maximumPlanarThicknessMeters);
         coarseGridSpacingMeters = Mathf.Max(0.02f, coarseGridSpacingMeters);
         configuredBoundsSize.x = Mathf.Max(0.02f, configuredBoundsSize.x);
         configuredBoundsSize.y = Mathf.Max(0.02f, configuredBoundsSize.y);
@@ -243,6 +254,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         maximumLiveDataAgeSeconds = Mathf.Max(0.5f, maximumLiveDataAgeSeconds);
         boundaryMarginInCoarseCells = Mathf.Clamp(boundaryMarginInCoarseCells, 0.5f, 2f);
         minimumFitQuality = Mathf.Clamp01(minimumFitQuality);
+        maximumPlanarRelativeRms = Mathf.Clamp(maximumPlanarRelativeRms, 0.05f, 1f);
 
         if (sourceMaterial != null)
             ApplySourceMaterialColor();
@@ -340,8 +352,23 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
 
         if (requireServerConnection && requireFreshLiveData)
         {
+            // This component is normally added by DetectorWorldMarkerManager at
+            // runtime. If the receiver published its first snapshot just before
+            // that happens, the event was missed even though the receiver still
+            // owns a valid fresh dictionary. Seed from the receiver so the source
+            // estimate does not wait forever for a second server message.
+            bool receiverHasFreshData = radiationReceiver != null &&
+                                        radiationReceiver.HasFreshRadiationData;
+            if (receiverHasFreshData && !hasReceivedLiveData)
+            {
+                hasReceivedLiveData = true;
+                lastLiveDataTime = Time.unscaledTime;
+            }
+
             float liveDataAge = Time.unscaledTime - lastLiveDataTime;
-            if (!hasReceivedLiveData || liveDataAge > maximumLiveDataAgeSeconds)
+            if (!receiverHasFreshData ||
+                !hasReceivedLiveData ||
+                liveDataAge > maximumLiveDataAgeSeconds)
             {
                 CancelSearch();
                 HasEstimate = false;
@@ -383,7 +410,10 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         hasObservedSnapshot = true;
         lastObservedSnapshotHash = snapshotHash;
 
-        if (!ValidateSamples(sampleBuffer, out string validationMessage))
+        if (!ValidateSamples(
+                sampleBuffer,
+                out DetectorGeometry detectorGeometry,
+                out string validationMessage))
         {
             CancelSearch();
             HasEstimate = false;
@@ -400,7 +430,8 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
 
         List<DetectorSample> snapshot = new List<DetectorSample>(sampleBuffer);
         int generation = ++estimationGeneration;
-        estimationCoroutine = StartCoroutine(EstimateSourceCoroutine(snapshot, generation));
+        estimationCoroutine = StartCoroutine(
+            EstimateSourceCoroutine(snapshot, detectorGeometry, generation));
     }
 
     private bool PrepareCoordinateInput(out bool inputChanged)
@@ -577,8 +608,13 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         }
     }
 
-    private bool ValidateSamples(List<DetectorSample> samples, out string message)
+    private bool ValidateSamples(
+        List<DetectorSample> samples,
+        out DetectorGeometry geometry,
+        out string message)
     {
+        geometry = default;
+
         if (samples.Count < minimumDetectorCount)
         {
             State = EstimatorState.WaitingForDetectors;
@@ -607,12 +643,10 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             return false;
         }
 
-        if (!HasSufficientSpatialGeometry(samples, out float outOfPlaneSpan))
+        if (!TryAnalyzeDetectorGeometry(samples, out geometry))
         {
             State = EstimatorState.InsufficientGeometry;
-            message = requireNonCoplanarGeometry
-                ? $"detector layout is planar (3D thickness {outOfPlaneSpan:F3} m)"
-                : "detector layout is nearly collinear";
+            message = "detector layout is nearly collinear";
             return false;
         }
 
@@ -623,22 +657,57 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             return false;
         }
 
-        message = "ready";
+        message = geometry.isPlanar
+            ? $"ready for planar source projection ({geometry.outOfPlaneSpan:F3} m thickness)"
+            : "ready";
         return true;
     }
 
-    private IEnumerator EstimateSourceCoroutine(List<DetectorSample> samples, int generation)
+    private IEnumerator EstimateSourceCoroutine(
+        List<DetectorSample> samples,
+        DetectorGeometry geometry,
+        int generation)
     {
         State = EstimatorState.Searching;
-        StateMessage = $"searching with {samples.Count} detectors";
+        StateMessage = geometry.isPlanar
+            ? $"searching detector plane with {samples.Count} detectors"
+            : $"searching with {samples.Count} detectors";
         estimateQueued = false;
 
-        GetInitialSearchBounds(samples, out Vector3 searchMin, out Vector3 searchMax);
-        Vector3 volumeMin = searchMin;
-        Vector3 volumeMax = searchMax;
-        float spacing = LimitCoarseSpacing(searchMin, searchMax, coarseGridSpacingMeters);
+        Vector3 searchMin = default;
+        Vector3 searchMax = default;
+        Vector3 volumeMin = default;
+        Vector3 volumeMax = default;
+        Vector2 planarSearchMin = default;
+        Vector2 planarSearchMax = default;
+        Vector2 planarVolumeMin = default;
+        Vector2 planarVolumeMax = default;
+        float spacing;
+
+        if (geometry.isPlanar)
+        {
+            GetInitialPlanarSearchBounds(
+                samples,
+                geometry,
+                out planarSearchMin,
+                out planarSearchMax);
+            planarVolumeMin = planarSearchMin;
+            planarVolumeMax = planarSearchMax;
+            spacing = LimitPlanarCoarseSpacing(
+                planarSearchMin,
+                planarSearchMax,
+                coarseGridSpacingMeters);
+        }
+        else
+        {
+            GetInitialSearchBounds(samples, out searchMin, out searchMax);
+            volumeMin = searchMin;
+            volumeMax = searchMax;
+            spacing = LimitCoarseSpacing(searchMin, searchMax, coarseGridSpacingMeters);
+        }
+
         float initialCoarseSpacing = spacing;
-        Vector3 bestPosition = Vector3.zero;
+        Vector3 bestPosition = geometry.planeOrigin;
         double bestActivity = 0d;
         double bestNll = double.PositiveInfinity;
         int frameCandidateCount = 0;
@@ -649,22 +718,49 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             if (pass > 0)
             {
                 float radius = spacing * refinementRadiusInPreviousCells;
-                searchMin = Vector3.Max(volumeMin, bestPosition - Vector3.one * radius);
-                searchMax = Vector3.Min(volumeMax, bestPosition + Vector3.one * radius);
+                if (geometry.isPlanar)
+                {
+                    Vector2 bestPlanePosition = ToPlaneCoordinates(geometry, bestPosition);
+                    planarSearchMin = Vector2.Max(
+                        planarVolumeMin,
+                        bestPlanePosition - Vector2.one * radius);
+                    planarSearchMax = Vector2.Min(
+                        planarVolumeMax,
+                        bestPlanePosition + Vector2.one * radius);
+                }
+                else
+                {
+                    searchMin = Vector3.Max(
+                        volumeMin,
+                        bestPosition - Vector3.one * radius);
+                    searchMax = Vector3.Min(
+                        volumeMax,
+                        bestPosition + Vector3.one * radius);
+                }
+
                 spacing /= refinementDivision;
             }
 
-            int xCount = AxisPointCount(searchMin.x, searchMax.x, spacing);
-            int yCount = AxisPointCount(searchMin.y, searchMax.y, spacing);
-            int zCount = AxisPointCount(searchMin.z, searchMax.z, spacing);
-
-            for (int xi = 0; xi < xCount; xi++)
+            if (geometry.isPlanar)
             {
-                float x = AxisCoordinate(searchMin.x, searchMax.x, spacing, xi, xCount);
-                for (int yi = 0; yi < yCount; yi++)
+                int uCount = AxisPointCount(
+                    planarSearchMin.x,
+                    planarSearchMax.x,
+                    spacing);
+                int vCount = AxisPointCount(
+                    planarSearchMin.y,
+                    planarSearchMax.y,
+                    spacing);
+
+                for (int ui = 0; ui < uCount; ui++)
                 {
-                    float y = AxisCoordinate(searchMin.y, searchMax.y, spacing, yi, yCount);
-                    for (int zi = 0; zi < zCount; zi++)
+                    float u = AxisCoordinate(
+                        planarSearchMin.x,
+                        planarSearchMax.x,
+                        spacing,
+                        ui,
+                        uCount);
+                    for (int vi = 0; vi < vCount; vi++)
                     {
                         if (generation != estimationGeneration)
                         {
@@ -672,11 +768,21 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
                             yield break;
                         }
 
-                        float z = AxisCoordinate(searchMin.z, searchMax.z, spacing, zi, zCount);
-                        Vector3 candidate = new Vector3(x, y, z);
+                        float v = AxisCoordinate(
+                            planarSearchMin.y,
+                            planarSearchMax.y,
+                            spacing,
+                            vi,
+                            vCount);
+                        Vector3 candidate = FromPlaneCoordinates(geometry, u, v);
                         EvaluateCandidate(samples, candidate, out double activity, out double nll);
 
-                        if (nll < bestNll)
+                        if (IsBetterCandidate(
+                                nll,
+                                candidate,
+                                bestNll,
+                                bestPosition,
+                                geometry.planeOrigin))
                         {
                             bestNll = nll;
                             bestPosition = candidate;
@@ -692,6 +798,71 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
                     }
                 }
             }
+            else
+            {
+                int xCount = AxisPointCount(searchMin.x, searchMax.x, spacing);
+                int yCount = AxisPointCount(searchMin.y, searchMax.y, spacing);
+                int zCount = AxisPointCount(searchMin.z, searchMax.z, spacing);
+
+                for (int xi = 0; xi < xCount; xi++)
+                {
+                    float x = AxisCoordinate(
+                        searchMin.x,
+                        searchMax.x,
+                        spacing,
+                        xi,
+                        xCount);
+                    for (int yi = 0; yi < yCount; yi++)
+                    {
+                        float y = AxisCoordinate(
+                            searchMin.y,
+                            searchMax.y,
+                            spacing,
+                            yi,
+                            yCount);
+                        for (int zi = 0; zi < zCount; zi++)
+                        {
+                            if (generation != estimationGeneration)
+                            {
+                                estimationCoroutine = null;
+                                yield break;
+                            }
+
+                            float z = AxisCoordinate(
+                                searchMin.z,
+                                searchMax.z,
+                                spacing,
+                                zi,
+                                zCount);
+                            Vector3 candidate = new Vector3(x, y, z);
+                            EvaluateCandidate(
+                                samples,
+                                candidate,
+                                out double activity,
+                                out double nll);
+
+                            if (IsBetterCandidate(
+                                    nll,
+                                    candidate,
+                                    bestNll,
+                                    bestPosition,
+                                    geometry.planeOrigin))
+                            {
+                                bestNll = nll;
+                                bestPosition = candidate;
+                                bestActivity = activity;
+                            }
+
+                            frameCandidateCount++;
+                            if (frameCandidateCount >= candidatesPerFrame)
+                            {
+                                frameCandidateCount = 0;
+                                yield return null;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         CalculateFitMetrics(
@@ -702,12 +873,20 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             out float fitQuality,
             out float rmsResidualCps);
 
-        if (rejectSearchBoundarySolutions &&
-            IsNearSearchBoundary(
+        float boundaryMargin = initialCoarseSpacing * boundaryMarginInCoarseCells;
+        bool isNearSearchBoundary = geometry.isPlanar
+            ? IsNearSearchBoundary(
+                ToPlaneCoordinates(geometry, bestPosition),
+                planarVolumeMin,
+                planarVolumeMax,
+                boundaryMargin)
+            : IsNearSearchBoundary(
                 bestPosition,
                 volumeMin,
                 volumeMax,
-                initialCoarseSpacing * boundaryMarginInCoarseCells))
+                boundaryMargin);
+
+        if (rejectSearchBoundarySolutions && isNearSearchBoundary)
         {
             HasEstimate = false;
             SetSourceVisualVisible(false);
@@ -718,13 +897,19 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             yield break;
         }
 
-        if (fitQuality < minimumFitQuality)
+        float meanExcessCps = CalculateMeanExcessCps(samples);
+        float relativeRms = rmsResidualCps / Mathf.Max(1f, meanExcessCps);
+        bool planarResidualAccepted = geometry.isPlanar &&
+                                      relativeRms <= maximumPlanarRelativeRms;
+
+        if (fitQuality < minimumFitQuality && !planarResidualAccepted)
         {
             HasEstimate = false;
             SetSourceVisualVisible(false);
             State = EstimatorState.PoorFit;
-            StateMessage =
-                $"single-source fit is too weak ({fitQuality:F2} < {minimumFitQuality:F2})";
+            StateMessage = geometry.isPlanar
+                ? $"planar source fit is too weak (fit {fitQuality:F2}, relative RMS {relativeRms:F2})"
+                : $"single-source fit is too weak ({fitQuality:F2} < {minimumFitQuality:F2})";
             FinishSearchCycle();
             yield break;
         }
@@ -743,9 +928,11 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             spacing);
         HasEstimate = true;
         State = EstimatorState.Ready;
-        StateMessage =
-            $"source ({bestPosition.x:F2}, {bestPosition.y:F2}, {bestPosition.z:F2}) m, " +
-            $"fit {fitQuality:F2}, RMS {rmsResidualCps:F1} CPS";
+        StateMessage = geometry.isPlanar
+            ? $"source projection ({bestPosition.x:F2}, {bestPosition.y:F2}, {bestPosition.z:F2}) m, " +
+              $"fit {fitQuality:F2}, RMS {rmsResidualCps:F1} CPS"
+            : $"source ({bestPosition.x:F2}, {bestPosition.y:F2}, {bestPosition.z:F2}) m, " +
+              $"fit {fitQuality:F2}, RMS {rmsResidualCps:F1} CPS";
 
         EnsureSourceVisual();
         SetSourceVisualVisible(showEstimatedSource);
@@ -782,6 +969,73 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         return point.x <= minimum.x + margin || point.x >= maximum.x - margin ||
                point.y <= minimum.y + margin || point.y >= maximum.y - margin ||
                point.z <= minimum.z + margin || point.z >= maximum.z - margin;
+    }
+
+    private static bool IsNearSearchBoundary(
+        Vector2 point,
+        Vector2 minimum,
+        Vector2 maximum,
+        float margin)
+    {
+        margin = Mathf.Max(0.0001f, margin);
+        return point.x <= minimum.x + margin || point.x >= maximum.x - margin ||
+               point.y <= minimum.y + margin || point.y >= maximum.y - margin;
+    }
+
+    private void GetInitialPlanarSearchBounds(
+        List<DetectorSample> samples,
+        DetectorGeometry geometry,
+        out Vector2 searchMin,
+        out Vector2 searchMax)
+    {
+        if (useConfiguredSearchBounds)
+        {
+            Vector3 halfSize = configuredBoundsSize * 0.5f;
+            searchMin = new Vector2(float.PositiveInfinity, float.PositiveInfinity);
+            searchMax = new Vector2(float.NegativeInfinity, float.NegativeInfinity);
+
+            for (int xSign = -1; xSign <= 1; xSign += 2)
+            {
+                for (int ySign = -1; ySign <= 1; ySign += 2)
+                {
+                    for (int zSign = -1; zSign <= 1; zSign += 2)
+                    {
+                        Vector3 corner = configuredBoundsCenter + Vector3.Scale(
+                            halfSize,
+                            new Vector3(xSign, ySign, zSign));
+                        Vector2 planePoint = ToPlaneCoordinates(geometry, corner);
+                        searchMin = Vector2.Min(searchMin, planePoint);
+                        searchMax = Vector2.Max(searchMax, planePoint);
+                    }
+                }
+            }
+        }
+        else
+        {
+            searchMin = ToPlaneCoordinates(geometry, samples[0].coordinatePosition);
+            searchMax = searchMin;
+            for (int i = 1; i < samples.Count; i++)
+            {
+                Vector2 planePoint = ToPlaneCoordinates(
+                    geometry,
+                    samples[i].coordinatePosition);
+                searchMin = Vector2.Min(searchMin, planePoint);
+                searchMax = Vector2.Max(searchMax, planePoint);
+            }
+
+            Vector2 padding = Vector2.one * searchPaddingMeters;
+            searchMin -= padding;
+            searchMax += padding;
+        }
+
+        EnsureMinimumAxisSize(
+            ref searchMin.x,
+            ref searchMax.x,
+            coarseGridSpacingMeters * 2f);
+        EnsureMinimumAxisSize(
+            ref searchMin.y,
+            ref searchMax.y,
+            coarseGridSpacingMeters * 2f);
     }
 
     private void GetInitialSearchBounds(
@@ -827,6 +1081,62 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
 
         double scale = Math.Pow(candidateCount / maximumCoarseCandidates, 1d / 3d);
         return Mathf.Max(requestedSpacing, (float)(requestedSpacing * scale));
+    }
+
+    private float LimitPlanarCoarseSpacing(
+        Vector2 min,
+        Vector2 max,
+        float requestedSpacing)
+    {
+        double xCount = Math.Ceiling((max.x - min.x) / requestedSpacing) + 1d;
+        double yCount = Math.Ceiling((max.y - min.y) / requestedSpacing) + 1d;
+        double candidateCount = xCount * yCount;
+
+        if (candidateCount <= maximumCoarseCandidates)
+            return requestedSpacing;
+
+        double scale = Math.Sqrt(candidateCount / maximumCoarseCandidates);
+        return Mathf.Max(requestedSpacing, (float)(requestedSpacing * scale));
+    }
+
+    private static Vector2 ToPlaneCoordinates(
+        DetectorGeometry geometry,
+        Vector3 position)
+    {
+        Vector3 relative = position - geometry.planeOrigin;
+        return new Vector2(
+            Vector3.Dot(relative, geometry.axisU),
+            Vector3.Dot(relative, geometry.axisV));
+    }
+
+    private static Vector3 FromPlaneCoordinates(
+        DetectorGeometry geometry,
+        float u,
+        float v)
+    {
+        return geometry.planeOrigin + geometry.axisU * u + geometry.axisV * v;
+    }
+
+    private static bool IsBetterCandidate(
+        double candidateNll,
+        Vector3 candidatePosition,
+        double bestNll,
+        Vector3 bestPosition,
+        Vector3 detectorCentroid)
+    {
+        if (double.IsPositiveInfinity(bestNll))
+            return true;
+
+        double tolerance = Math.Max(1e-9d, Math.Abs(bestNll) * 1e-9d);
+        if (candidateNll < bestNll - tolerance)
+            return true;
+        if (Math.Abs(candidateNll - bestNll) > tolerance)
+            return false;
+
+        float candidateDistanceSquared =
+            (candidatePosition - detectorCentroid).sqrMagnitude;
+        float bestDistanceSquared = (bestPosition - detectorCentroid).sqrMagnitude;
+        return candidateDistanceSquared < bestDistanceSquared - 1e-8f;
     }
 
     private void EvaluateCandidate(
@@ -1003,6 +1313,19 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         rmsResidualCps = (float)Math.Sqrt(squaredResidualSum / samples.Count);
     }
 
+    private static float CalculateMeanExcessCps(List<DetectorSample> samples)
+    {
+        double sum = 0d;
+        for (int i = 0; i < samples.Count; i++)
+        {
+            sum += Math.Max(
+                0d,
+                samples[i].observedCps - samples[i].backgroundCps);
+        }
+
+        return samples.Count > 0 ? (float)(sum / samples.Count) : 0f;
+    }
+
     private static double PoissonDevianceTerm(double observed, double predicted)
     {
         if (observed <= 0d)
@@ -1110,30 +1433,36 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         max = center + size * 0.5f;
     }
 
-    private bool HasSufficientSpatialGeometry(
+    private bool TryAnalyzeDetectorGeometry(
         List<DetectorSample> samples,
-        out float outOfPlaneSpan)
+        out DetectorGeometry geometry)
     {
-        Vector3 first = samples[0].coordinatePosition;
+        geometry = default;
+
+        int firstIndex = 0;
         int farthestIndex = 1;
         float farthestDistanceSquared = 0f;
-        for (int i = 1; i < samples.Count; i++)
+        for (int i = 0; i < samples.Count - 1; i++)
         {
-            float distanceSquared = (samples[i].coordinatePosition - first).sqrMagnitude;
-            if (distanceSquared > farthestDistanceSquared)
+            for (int j = i + 1; j < samples.Count; j++)
             {
-                farthestDistanceSquared = distanceSquared;
-                farthestIndex = i;
+                float distanceSquared = (
+                    samples[j].coordinatePosition -
+                    samples[i].coordinatePosition).sqrMagnitude;
+                if (distanceSquared > farthestDistanceSquared)
+                {
+                    farthestDistanceSquared = distanceSquared;
+                    firstIndex = i;
+                    farthestIndex = j;
+                }
             }
         }
 
+        Vector3 first = samples[firstIndex].coordinatePosition;
         Vector3 line = samples[farthestIndex].coordinatePosition - first;
         float lineLength = line.magnitude;
         if (lineLength < minimumDetectorSpanMeters)
-        {
-            outOfPlaneSpan = 0f;
             return false;
-        }
 
         Vector3 lineDirection = line / lineLength;
         int triangleIndex = -1;
@@ -1149,26 +1478,38 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             }
         }
 
-        if (triangleIndex < 0 || greatestLineOffset < minimumGeometryThicknessMeters)
-        {
-            outOfPlaneSpan = 0f;
+        if (triangleIndex < 0 || greatestLineOffset < minimumNonCollinearOffsetMeters)
             return false;
-        }
 
         Vector3 planeNormal = Vector3.Cross(
-            line,
+            lineDirection,
             samples[triangleIndex].coordinatePosition - first).normalized;
-        outOfPlaneSpan = 0f;
+        Vector3 planeOrigin = Vector3.zero;
+        for (int i = 0; i < samples.Count; i++)
+            planeOrigin += samples[i].coordinatePosition;
+        planeOrigin /= samples.Count;
+
+        float minimumPlaneOffset = float.PositiveInfinity;
+        float maximumPlaneOffset = float.NegativeInfinity;
         for (int i = 0; i < samples.Count; i++)
         {
-            float planeOffset = Mathf.Abs(Vector3.Dot(
+            float planeOffset = Vector3.Dot(
                 planeNormal,
-                samples[i].coordinatePosition - first));
-            outOfPlaneSpan = Mathf.Max(outOfPlaneSpan, planeOffset);
+                samples[i].coordinatePosition - planeOrigin);
+            minimumPlaneOffset = Mathf.Min(minimumPlaneOffset, planeOffset);
+            maximumPlaneOffset = Mathf.Max(maximumPlaneOffset, planeOffset);
         }
 
-        return !requireNonCoplanarGeometry ||
-               outOfPlaneSpan >= minimumGeometryThicknessMeters;
+        float outOfPlaneSpan = maximumPlaneOffset - minimumPlaneOffset;
+        Vector3 axisV = Vector3.Cross(planeNormal, lineDirection).normalized;
+        geometry = new DetectorGeometry(
+            outOfPlaneSpan <= maximumPlanarThicknessMeters,
+            planeOrigin,
+            lineDirection,
+            axisV,
+            planeNormal,
+            outOfPlaneSpan);
+        return true;
     }
 
     private static int ComputeSnapshotHash(List<DetectorSample> samples)
@@ -1200,6 +1541,32 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
     private static bool IsFinite(Vector3 value)
     {
         return IsFinite(value.x) && IsFinite(value.y) && IsFinite(value.z);
+    }
+
+    private readonly struct DetectorGeometry
+    {
+        public readonly bool isPlanar;
+        public readonly Vector3 planeOrigin;
+        public readonly Vector3 axisU;
+        public readonly Vector3 axisV;
+        public readonly Vector3 planeNormal;
+        public readonly float outOfPlaneSpan;
+
+        public DetectorGeometry(
+            bool isPlanar,
+            Vector3 planeOrigin,
+            Vector3 axisU,
+            Vector3 axisV,
+            Vector3 planeNormal,
+            float outOfPlaneSpan)
+        {
+            this.isPlanar = isPlanar;
+            this.planeOrigin = planeOrigin;
+            this.axisU = axisU;
+            this.axisV = axisV;
+            this.planeNormal = planeNormal;
+            this.outOfPlaneSpan = outOfPlaneSpan;
+        }
     }
 
     private struct DetectorSample

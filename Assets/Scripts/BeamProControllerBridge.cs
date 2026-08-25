@@ -1031,7 +1031,7 @@ public class BeamProControllerBridge : MonoBehaviour
                 case RadiationSourceEstimator.EstimatorState.InsufficientGeometry:
                     requiredAction = "REPOSITION DETECTORS";
                     requiredInstruction =
-                        "Rescan a detector and spread positions across width, depth and height.";
+                        "Place detectors in a wide square instead of along one line.";
                     guideColor = new Color(1f, 0.86f, 0.38f, 1f);
                     break;
                 case RadiationSourceEstimator.EstimatorState.OutOfSearchBounds:
