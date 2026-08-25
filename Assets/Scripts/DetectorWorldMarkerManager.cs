@@ -88,6 +88,19 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [Tooltip("Optional vertical offset while previewing/placing. Usually 0.")]
     [SerializeField] private float markerVerticalOffsetMeters = 0f;
 
+    [Header("Placement Preview Visual")]
+    [Tooltip("ON = the detector preview always renders as a neutral gray sphere until PlaceDetector() fixes it, whatever the CPS reading is. Risk colors start only after placement.")]
+    [SerializeField] private bool showGrayPreviewSphere = true;
+
+    [Tooltip("Color of the preview sphere shown before placement.")]
+    [SerializeField] private Color previewSphereColor = new Color(0.75f, 0.75f, 0.75f, 1f);
+
+    [Tooltip("Opacity of the preview sphere. Keep it above Marker Alpha so the preview stays easy to see while aiming.")]
+    [SerializeField, Range(0.05f, 1f)] private float previewSphereAlpha = 0.35f;
+
+    [Tooltip("ON = the preview sphere stays visible before the WebSocket server is connected, even while placed detectors are still hidden.")]
+    [SerializeField] private bool showPreviewBeforeServerConnected = true;
+
     [Tooltip("Approximate Beam Pro rear camera horizontal FOV. Used only when not using pure center placement.")]
     [SerializeField] private float cameraHorizontalFovDegrees = 70f;
 
@@ -587,9 +600,34 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             marker.hasValidPlaneHit = false;
             marker.anchorState = waitingForPlaneStateLabel;
 
-            if (hidePreviewWithoutPlaneHit && marker.root != null)
-                SetMarkerRequestedVisibility(marker, false);
+            if (hidePreviewWithoutPlaneHit)
+            {
+                if (marker.root != null)
+                    SetMarkerRequestedVisibility(marker, false);
 
+                return;
+            }
+
+            // Keep the preview attached to the gaze center at the default distance
+            // instead of leaving it frozen at a stale pose while plane tracking
+            // catches up. PlaceDetector still refuses to commit without a plane hit.
+            Vector3 fallbackDirection = placementOrigin.forward.sqrMagnitude > 0.0001f
+                ? placementOrigin.forward.normalized
+                : Vector3.forward;
+
+            Vector3 fallbackPosition =
+                placementOrigin.position +
+                fallbackDirection * defaultPlacementDistanceMeters +
+                placementOrigin.up * markerVerticalOffsetMeters;
+
+            SetMarkerRequestedVisibility(marker, true);
+            marker.root.transform.position = fallbackPosition;
+            marker.root.transform.rotation =
+                Quaternion.LookRotation(fallbackDirection, placementOrigin.up);
+            marker.root.transform.localScale = Vector3.one * fixedMarkerSize;
+
+            marker.savedPosition = fallbackPosition;
+            marker.lastEstimatedDistance = defaultPlacementDistanceMeters;
             return;
         }
 
@@ -1561,8 +1599,10 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         marker.lastRadiationValue = radiationValue;
 
         RadiationRiskBand riskBand = GetRiskBand(radiationValue);
-        Color color = GetRiskColor(radiationValue);
-        color.a = markerAlpha;
+        bool useGrayPreview = showGrayPreviewSphere && IsPreviewMarker(marker);
+
+        Color color = useGrayPreview ? previewSphereColor : GetRiskColor(radiationValue);
+        color.a = useGrayPreview ? Mathf.Clamp01(previewSphereAlpha) : markerAlpha;
         marker.centerMaterial =
             SetRendererTransparentColor(marker.renderer, color, 10, false);
 
@@ -1570,9 +1610,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         // Cancel, and anchor state continue to work even when 0-2 CPS hides the
         // center sphere. An unknown preview stays visible for placement; an
         // already placed detector with no valid reading stays visually quiet.
+        // A gray preview is an aiming aid, so it ignores the CPS bands entirely
+        // and stays visible even at a hidden 0-2 CPS reading.
         marker.centerVisualRequested =
-            riskBand != RadiationRiskBand.Hidden &&
-            (riskBand != RadiationRiskBand.Unknown || !marker.isPlaced);
+            useGrayPreview ||
+            (riskBand != RadiationRiskBand.Hidden &&
+             (riskBand != RadiationRiskBand.Unknown || !marker.isPlaced));
 
         UpdateFalloffShellVisuals(marker, radiationValue, riskBand);
 
@@ -1873,6 +1916,13 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         }
     }
 
+    private bool IsPreviewMarker(MarkerInfo marker)
+    {
+        return marker != null &&
+               marker.isFollowingPlacementOrigin &&
+               !marker.isPlaced;
+    }
+
     private void ForceMarkerVisible(MarkerInfo marker)
     {
         if (marker == null)
@@ -1895,14 +1945,26 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (marker == null)
             return;
 
+        // The preview is a placement aid, not a measurement, so it does not have to
+        // wait for the radiation server. Otherwise the sphere the user is aiming with
+        // is invisible during an offline or not-yet-connected placement.
+        bool previewIgnoresServerGate =
+            showPreviewBeforeServerConnected && IsPreviewMarker(marker);
+
         bool visible = marker.visibilityRequested &&
-                       (!hideMarkersUntilServerConnected || serverConnected);
+                       (previewIgnoresServerGate ||
+                        !hideMarkersUntilServerConnected ||
+                        serverConnected);
 
         if (marker.root != null)
             marker.root.SetActive(visible);
 
         if (marker.renderer != null)
-            marker.renderer.enabled = visible && marker.centerVisualRequested;
+        {
+            bool centerVisible = marker.centerVisualRequested ||
+                                 (showGrayPreviewSphere && IsPreviewMarker(marker));
+            marker.renderer.enabled = visible && centerVisible;
+        }
 
         if (marker.falloffShells != null)
         {
