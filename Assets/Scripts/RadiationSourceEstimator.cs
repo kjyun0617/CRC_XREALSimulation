@@ -121,11 +121,22 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
     [SerializeField, Min(100)] private int candidatesPerFrame = 2000;
     [SerializeField, Min(0.1f)] private float detectorSnapshotIntervalSeconds = 0.5f;
 
+    [Header("Estimated Source History")]
+    [Tooltip("Average source positions recorded over this rolling time window before showing the probability cloud.")]
+    [SerializeField, Min(1f)] private float sourceHistoryWindowSeconds = 10f;
+    [Tooltip("Record the current accepted estimate at this fixed interval even when CPS values have not changed.")]
+    [SerializeField, Min(0.1f)] private float sourceHistorySampleIntervalSeconds = 0.5f;
+
     [Header("Estimated Source Visual")]
     [SerializeField] private bool showEstimatedSource = true;
+    [Tooltip("Small instantaneous point shown only while the initial history window is being collected.")]
     [SerializeField, Min(0.03f)] private float sourceSphereDiameterMeters = 0.18f;
     [SerializeField] private Color sourceSphereColor = new Color(1f, 0.08f, 0.02f, 1f);
     [SerializeField, Range(0.05f, 1f)] private float sourceSphereAlpha = 0.48f;
+    [Tooltip("Diameter of the probability cloud shown at the center of the latest source-position history.")]
+    [SerializeField, Min(0.1f)] private float sourceCloudDiameterMeters = 1f;
+    [Tooltip("Keep the one-meter cloud faint enough not to block the XREAL view.")]
+    [SerializeField, Range(0.02f, 0.5f)] private float sourceCloudAlpha = 0.11f;
     [SerializeField] private bool pulseSourceSphere;
     [SerializeField, Min(0.05f)] private float pulseCyclesPerSecond = 0.8f;
     [SerializeField, Range(0f, 0.3f)] private float pulseScaleAmount = 0.06f;
@@ -138,16 +149,23 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
     public EstimatorState State { get; private set; } = EstimatorState.Disabled;
     public string StateMessage { get; private set; } = "disabled";
     public bool HasEstimate { get; private set; }
+    public bool HasProbabilityCloud => HasEstimate && sourceCloudReady;
     public SourceEstimate LatestEstimate { get; private set; }
     public Transform CoordinateFrame => coordinateFrame;
     public Vector3 EstimatedWorldPosition =>
         coordinateFrame != null
             ? coordinateFrame.TransformPoint(LatestEstimate.coordinatePosition)
             : LatestEstimate.coordinatePosition;
+    public Vector3 VisualizedWorldPosition =>
+        coordinateFrame != null
+            ? coordinateFrame.TransformPoint(CurrentVisualCoordinatePosition)
+            : CurrentVisualCoordinatePosition;
 
     private readonly List<DetectorWorldMarkerManager.DetectorHudMarkerState> markerStates =
         new List<DetectorWorldMarkerManager.DetectorHudMarkerState>();
     private readonly List<DetectorSample> sampleBuffer = new List<DetectorSample>();
+    private readonly List<TimedSourcePosition> sourcePositionHistory =
+        new List<TimedSourcePosition>();
     private Coroutine estimationCoroutine;
     private GameObject sourceVisual;
     private Renderer sourceRenderer;
@@ -161,6 +179,15 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
     private bool hasReceivedLiveData;
     private float lastLiveDataTime = float.NegativeInfinity;
     private string activeRoomId = "";
+    private Vector3 sourceHistoryCenterCoordinatePosition;
+    private float sourceHistoryCollectionStartTime = float.NegativeInfinity;
+    private float nextSourceHistorySampleTime;
+    private bool sourceCloudReady;
+
+    private Vector3 CurrentVisualCoordinatePosition =>
+        sourceCloudReady
+            ? sourceHistoryCenterCoordinatePosition
+            : LatestEstimate.coordinatePosition;
 
     private void OnEnable()
     {
@@ -171,6 +198,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         EnsureReferences();
         serverConnected = radiationReceiver != null && radiationReceiver.IsConnected;
         hasObservedSnapshot = false;
+        ClearSourcePositionHistory();
         State = EstimatorState.WaitingForDetectors;
         StateMessage = "waiting for placed detectors";
         nextSnapshotTime = 0f;
@@ -188,11 +216,10 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         RadiationReceiver.OnRadiationDataReceived -= HandleRadiationDataReceived;
         RadiationReceiver.OnServerConnectionChanged -= HandleServerConnectionChanged;
         CancelSearch();
-        HasEstimate = false;
+        InvalidateEstimate();
         hasObservedSnapshot = false;
         hasReceivedLiveData = false;
         lastLiveDataTime = float.NegativeInfinity;
-        SetSourceVisualVisible(false);
         State = EstimatorState.Disabled;
         StateMessage = "disabled";
     }
@@ -207,11 +234,14 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
 
     private void Update()
     {
-        if (Time.unscaledTime >= nextSnapshotTime)
+        float now = Time.unscaledTime;
+        if (now >= nextSnapshotTime)
         {
-            nextSnapshotTime = Time.unscaledTime + detectorSnapshotIntervalSeconds;
+            nextSnapshotTime = now + detectorSnapshotIntervalSeconds;
             RefreshDetectorSnapshot(false);
         }
+
+        UpdateSourcePositionHistory(now);
     }
 
     private void LateUpdate()
@@ -220,18 +250,21 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             return;
 
         Vector3 worldPosition = coordinateFrame != null
-            ? coordinateFrame.TransformPoint(LatestEstimate.coordinatePosition)
-            : LatestEstimate.coordinatePosition;
+            ? coordinateFrame.TransformPoint(CurrentVisualCoordinatePosition)
+            : CurrentVisualCoordinatePosition;
         sourceVisual.transform.position = worldPosition;
 
         float pulse = 1f;
-        if (pulseSourceSphere)
+        if (pulseSourceSphere && !sourceCloudReady)
         {
             pulse += Mathf.Sin(Time.unscaledTime * Mathf.PI * 2f * pulseCyclesPerSecond) *
                      pulseScaleAmount;
         }
 
-        sourceVisual.transform.localScale = Vector3.one * sourceSphereDiameterMeters * pulse;
+        float diameter = sourceCloudReady
+            ? sourceCloudDiameterMeters
+            : sourceSphereDiameterMeters;
+        sourceVisual.transform.localScale = Vector3.one * diameter * pulse;
     }
 
     private void OnValidate()
@@ -251,6 +284,15 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         candidatesPerFrame = Mathf.Max(100, candidatesPerFrame);
         maximumCoarseCandidates = Mathf.Max(1000, maximumCoarseCandidates);
         detectorSnapshotIntervalSeconds = Mathf.Max(0.1f, detectorSnapshotIntervalSeconds);
+        sourceHistoryWindowSeconds = Mathf.Max(1f, sourceHistoryWindowSeconds);
+        sourceHistorySampleIntervalSeconds = Mathf.Clamp(
+            sourceHistorySampleIntervalSeconds,
+            0.1f,
+            sourceHistoryWindowSeconds * 0.5f);
+        sourceSphereDiameterMeters = Mathf.Max(0.03f, sourceSphereDiameterMeters);
+        sourceCloudDiameterMeters = Mathf.Max(0.1f, sourceCloudDiameterMeters);
+        sourceSphereAlpha = Mathf.Clamp(sourceSphereAlpha, 0.05f, 1f);
+        sourceCloudAlpha = Mathf.Clamp(sourceCloudAlpha, 0.02f, 0.5f);
         maximumLiveDataAgeSeconds = Mathf.Max(0.5f, maximumLiveDataAgeSeconds);
         boundaryMarginInCoarseCells = Mathf.Clamp(boundaryMarginInCoarseCells, 0.5f, 2f);
         minimumFitQuality = Mathf.Clamp01(minimumFitQuality);
@@ -271,8 +313,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
 
         coordinateFrame = roomFrame;
         CancelSearch();
-        HasEstimate = false;
-        SetSourceVisualVisible(false);
+        InvalidateEstimate();
         hasObservedSnapshot = false;
         nextSnapshotTime = 0f;
     }
@@ -287,10 +328,16 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
     public void ClearEstimate()
     {
         CancelSearch();
-        HasEstimate = false;
-        SetSourceVisualVisible(false);
+        InvalidateEstimate();
         State = EstimatorState.WaitingForDetectors;
         StateMessage = "estimate cleared";
+    }
+
+    private void InvalidateEstimate()
+    {
+        HasEstimate = false;
+        ClearSourcePositionHistory();
+        SetSourceVisualVisible(false);
     }
 
     private void EnsureReferences()
@@ -325,8 +372,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         if (!isConnected && requireServerConnection)
         {
             CancelSearch();
-            HasEstimate = false;
-            SetSourceVisualVisible(false);
+            InvalidateEstimate();
             State = EstimatorState.WaitingForServer;
             StateMessage = "waiting for server connection";
             return;
@@ -343,8 +389,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         if (requireServerConnection && !serverConnected)
         {
             CancelSearch();
-            HasEstimate = false;
-            SetSourceVisualVisible(false);
+            InvalidateEstimate();
             State = EstimatorState.WaitingForServer;
             StateMessage = "waiting for server connection";
             return;
@@ -371,9 +416,8 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
                 liveDataAge > maximumLiveDataAgeSeconds)
             {
                 CancelSearch();
-                HasEstimate = false;
+                InvalidateEstimate();
                 hasObservedSnapshot = false;
-                SetSourceVisualVisible(false);
                 State = EstimatorState.StaleRadiationData;
                 StateMessage = hasReceivedLiveData
                     ? $"CPS data stale ({liveDataAge:F1}s old)"
@@ -390,6 +434,8 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
 
         if (!useRoomCoordinateDatabase && markerManager == null)
         {
+            CancelSearch();
+            InvalidateEstimate();
             State = EstimatorState.WaitingForDetectors;
             StateMessage = "DetectorWorldMarkerManager not found";
             return;
@@ -416,8 +462,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
                 out string validationMessage))
         {
             CancelSearch();
-            HasEstimate = false;
-            SetSourceVisualVisible(false);
+            InvalidateEstimate();
             StateMessage = validationMessage;
             return;
         }
@@ -446,11 +491,8 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             string.IsNullOrWhiteSpace(roomCoordinateSystem.RoomId))
         {
             if (estimationCoroutine != null || HasEstimate)
-            {
                 CancelSearch();
-                HasEstimate = false;
-                SetSourceVisualVisible(false);
-            }
+            InvalidateEstimate();
 
             State = EstimatorState.WaitingForRoomOrigin;
             StateMessage = "scan and place ROOM_ORIGIN";
@@ -460,11 +502,8 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
         if (coordinateDatabase == null)
         {
             if (estimationCoroutine != null || HasEstimate)
-            {
                 CancelSearch();
-                HasEstimate = false;
-                SetSourceVisualVisible(false);
-            }
+            InvalidateEstimate();
 
             State = EstimatorState.WaitingForDetectors;
             StateMessage = "DetectorCoordinateDatabase not found";
@@ -476,8 +515,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             !string.Equals(activeRoomId, roomId, StringComparison.OrdinalIgnoreCase))
         {
             CancelSearch();
-            HasEstimate = false;
-            SetSourceVisualVisible(false);
+            InvalidateEstimate();
             coordinateFrame = roomCoordinateSystem.CoordinateFrame;
             activeRoomId = roomId;
             hasObservedSnapshot = false;
@@ -888,8 +926,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
 
         if (rejectSearchBoundarySolutions && isNearSearchBoundary)
         {
-            HasEstimate = false;
-            SetSourceVisualVisible(false);
+            InvalidateEstimate();
             State = EstimatorState.OutOfSearchBounds;
             StateMessage =
                 "best source is on the search boundary; expand/configure room bounds";
@@ -904,8 +941,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
 
         if (fitQuality < minimumFitQuality && !planarResidualAccepted)
         {
-            HasEstimate = false;
-            SetSourceVisualVisible(false);
+            InvalidateEstimate();
             State = EstimatorState.PoorFit;
             StateMessage = geometry.isPlanar
                 ? $"planar source fit is too weak (fit {fitQuality:F2}, relative RMS {relativeRms:F2})"
@@ -927,6 +963,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             samples.Count,
             spacing);
         HasEstimate = true;
+        UpdateSourcePositionHistory(Time.unscaledTime);
         State = EstimatorState.Ready;
         StateMessage = geometry.isPlanar
             ? $"source projection ({bestPosition.x:F2}, {bestPosition.y:F2}, {bestPosition.z:F2}) m, " +
@@ -957,6 +994,68 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             hasObservedSnapshot = false;
             nextSnapshotTime = 0f;
         }
+    }
+
+    private void UpdateSourcePositionHistory(float now)
+    {
+        if (!HasEstimate || now < nextSourceHistorySampleTime)
+            return;
+
+        RecordSourcePosition(LatestEstimate.coordinatePosition, now);
+    }
+
+    private void RecordSourcePosition(Vector3 coordinatePosition, float timestamp)
+    {
+        if (!IsFinite(coordinatePosition))
+            return;
+
+        bool cloudWasReady = sourceCloudReady;
+        if (sourcePositionHistory.Count > 0 &&
+            timestamp - sourcePositionHistory[sourcePositionHistory.Count - 1].timestamp >
+            sourceHistoryWindowSeconds)
+        {
+            sourcePositionHistory.Clear();
+        }
+
+        if (sourcePositionHistory.Count == 0)
+            sourceHistoryCollectionStartTime = timestamp;
+
+        sourcePositionHistory.Add(new TimedSourcePosition(timestamp, coordinatePosition));
+        nextSourceHistorySampleTime = timestamp + sourceHistorySampleIntervalSeconds;
+
+        float cutoffTime = timestamp - sourceHistoryWindowSeconds;
+        int expiredCount = 0;
+        while (expiredCount < sourcePositionHistory.Count &&
+               sourcePositionHistory[expiredCount].timestamp < cutoffTime)
+        {
+            expiredCount++;
+        }
+
+        if (expiredCount > 0)
+            sourcePositionHistory.RemoveRange(0, expiredCount);
+
+        Vector3 sum = Vector3.zero;
+        for (int i = 0; i < sourcePositionHistory.Count; i++)
+            sum += sourcePositionHistory[i].coordinatePosition;
+
+        sourceHistoryCenterCoordinatePosition =
+            sum / Mathf.Max(1, sourcePositionHistory.Count);
+
+        sourceCloudReady = sourcePositionHistory.Count >= 2 &&
+                           timestamp - sourceHistoryCollectionStartTime >=
+                           sourceHistoryWindowSeconds;
+        if (cloudWasReady != sourceCloudReady)
+            ApplySourceMaterialColor();
+    }
+
+    private void ClearSourcePositionHistory()
+    {
+        sourcePositionHistory.Clear();
+        sourceHistoryCenterCoordinatePosition = Vector3.zero;
+        sourceHistoryCollectionStartTime = float.NegativeInfinity;
+        nextSourceHistorySampleTime = 0f;
+        sourceCloudReady = false;
+        ApplySourceMaterialColor();
     }
 
     private static bool IsNearSearchBoundary(
@@ -1340,7 +1439,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             return;
 
         sourceVisual = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-        sourceVisual.name = "EstimatedRadiationSource";
+        sourceVisual.name = "EstimatedRadiationSourceVisual";
         sourceVisual.transform.SetParent(null, true);
 
         Collider sourceCollider = sourceVisual.GetComponent<Collider>();
@@ -1370,7 +1469,10 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             sourceRenderer.reflectionProbeUsage = ReflectionProbeUsage.Off;
         }
 
-        sourceVisual.transform.localScale = Vector3.one * sourceSphereDiameterMeters;
+        float diameter = sourceCloudReady
+            ? sourceCloudDiameterMeters
+            : sourceSphereDiameterMeters;
+        sourceVisual.transform.localScale = Vector3.one * diameter;
     }
 
     private void ApplySourceMaterialColor()
@@ -1379,7 +1481,7 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             return;
 
         Color color = sourceSphereColor;
-        color.a = sourceSphereAlpha;
+        color.a = sourceCloudReady ? sourceCloudAlpha : sourceSphereAlpha;
 
         if (sourceMaterial.HasProperty("_Color"))
             sourceMaterial.SetColor("_Color", color);
@@ -1566,6 +1668,18 @@ public sealed class RadiationSourceEstimator : MonoBehaviour
             this.axisV = axisV;
             this.planeNormal = planeNormal;
             this.outOfPlaneSpan = outOfPlaneSpan;
+        }
+    }
+
+    private readonly struct TimedSourcePosition
+    {
+        public readonly float timestamp;
+        public readonly Vector3 coordinatePosition;
+
+        public TimedSourcePosition(float timestamp, Vector3 coordinatePosition)
+        {
+            this.timestamp = timestamp;
+            this.coordinatePosition = coordinatePosition;
         }
     }
 
