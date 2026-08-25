@@ -67,9 +67,9 @@ public class BeamProControllerBridge : MonoBehaviour
     [SerializeField] private float detectorListCenterYOffset = 330f;
 
     [Header("Workflow Guide Layout")]
-    [SerializeField, Min(8f)] private float workflowGuideMinFontSize = 14f;
-    [SerializeField, Min(12f)] private float workflowGuideMaxFontSize = 34f;
-    [SerializeField, Min(128f)] private float workflowGuideHeight = 320f;
+    [SerializeField, Min(8f)] private float workflowGuideMinFontSize = 24f;
+    [SerializeField, Min(12f)] private float workflowGuideMaxFontSize = 44f;
+    [SerializeField, Min(128f)] private float workflowGuideHeight = 220f;
     [SerializeField] private float workflowGuideCenterYOffset = 330f;
     [SerializeField, Min(6f)] private float workflowButtonMinFontSize = 10f;
     [SerializeField, Min(10f)] private float workflowButtonMaxFontSize = 20f;
@@ -78,7 +78,6 @@ public class BeamProControllerBridge : MonoBehaviour
     [SerializeField] private bool autoFindReferences = true;
     [SerializeField] private bool logActions = true;
 
-    private string latestServerStatusMessage = "";
     private Color latestServerStatusColor = Color.white;
     private string transientActionMessage = "";
     private Color transientActionColor = Color.white;
@@ -268,7 +267,6 @@ public class BeamProControllerBridge : MonoBehaviour
         // RadiationReceiver may Awake after this prefab. Its first status update
         // is a reliable point at which the PlayerPrefs-backed address is loaded.
         SyncControllerIpField();
-        latestServerStatusMessage = message ?? "";
         latestServerStatusColor = color;
         workflowUiDirty = true;
     }
@@ -702,7 +700,7 @@ public class BeamProControllerBridge : MonoBehaviour
         controllerStatusText.fontSizeMin = minFontSize;
         controllerStatusText.fontSizeMax = maxFontSize;
         controllerStatusText.fontSize = maxFontSize;
-        controllerStatusText.alignment = TextAlignmentOptions.TopLeft;
+        controllerStatusText.alignment = TextAlignmentOptions.MidlineLeft;
         controllerStatusText.textWrappingMode = TextWrappingModes.Normal;
         controllerStatusText.overflowMode = TextOverflowModes.Ellipsis;
         controllerStatusText.richText = false;
@@ -808,6 +806,13 @@ public class BeamProControllerBridge : MonoBehaviour
 
         WorkflowPresentation presentation = BuildWorkflowPresentation();
 
+        bool showGuide = !string.IsNullOrWhiteSpace(presentation.guideText);
+        if (controllerStatusText != null &&
+            controllerStatusText.gameObject.activeSelf != showGuide)
+        {
+            controllerStatusText.gameObject.SetActive(showGuide);
+        }
+
         if (controllerStatusText != null &&
             (force || !string.Equals(
                 lastRenderedWorkflowText,
@@ -877,188 +882,178 @@ public class BeamProControllerBridge : MonoBehaviour
         int placedCount = markerManager != null
             ? markerManager.CurrentRoomPlacedDetectorCount
             : 0;
-        string undoDetectorId = "";
+        string ignoredUndoDetectorId = "";
         bool undoWaitingForRestore = false;
         bool hasUndoDetector =
             markerManager != null &&
             markerManager.TryPeekLastPlacedDetector(
-                out undoDetectorId,
+                out ignoredUndoDetectorId,
                 out undoWaitingForRestore);
 
-        string serverLine;
-        Color guideColor;
-        if (!serverAvailable)
+        string requiredAction = "";
+        string requiredInstruction = "";
+        Color guideColor = new Color(0.72f, 0.90f, 1f, 1f);
+
+        bool hasBlockingActionStatus =
+            !string.IsNullOrWhiteSpace(transientActionMessage) &&
+            Time.unscaledTime < transientActionExpiresAt &&
+            transientActionColor != Color.green &&
+            transientActionColor != Color.white;
+
+        if (hasBlockingActionStatus)
         {
-            serverLine = "SERVER: RECEIVER NOT FOUND";
+            requiredAction = "ACTION REQUIRED";
+            requiredInstruction = CompactUiMessage(transientActionMessage, 88);
+            guideColor = transientActionColor;
+        }
+        else if (!serverAvailable)
+        {
+            requiredAction = "SERVER SETUP REQUIRED";
+            requiredInstruction = "Restart the app or check the RadiationReceiver setup.";
             guideColor = new Color(1f, 0.55f, 0.50f, 1f);
         }
-        else if (connecting)
+        else if (scanActive)
         {
-            serverLine = "SERVER: CONNECTING";
-            guideColor = new Color(1f, 0.86f, 0.38f, 1f);
-        }
-        else if (!connected)
-        {
-            serverLine = "SERVER: DISCONNECTED";
-            guideColor = latestServerStatusColor.a > 0.01f
-                ? latestServerStatusColor
-                : new Color(1f, 0.55f, 0.50f, 1f);
-        }
-        else if (freshData)
-        {
-            serverLine = "SERVER: LIVE CPS";
-            guideColor = new Color(0.55f, 1f, 0.68f, 1f);
-        }
-        else if (receivedRadiationThisConnection)
-        {
-            serverLine = "SERVER: CPS STREAM STALE";
-            guideColor = new Color(1f, 0.78f, 0.34f, 1f);
-        }
-        else
-        {
-            serverLine = "SERVER: CONNECTED - WAITING FOR CPS";
-            guideColor = new Color(0.62f, 0.88f, 1f, 1f);
-        }
-
-        string stepTitle;
-        string primaryInstruction;
-        string secondaryInstruction;
-
-        if (scanActive)
-        {
-            bool scanningRoom = !roomCalibrated;
-            stepTitle = scanningRoom
-                ? "STEP 2 / 4 - SCAN ROOM QR"
-                : "STEP 3 / 4 - SCAN DETECTOR QR";
-            primaryInstruction = scanningRoom
-                ? "Point the Beam Pro camera at the room reference QR."
-                : "Point the Beam Pro camera at a detector QR.";
-            secondaryInstruction = "Tap CANCEL SCAN to stop.";
+            requiredAction = roomCalibrated
+                ? "SCAN DETECTOR QR"
+                : "SCAN ROOM QR";
+            requiredInstruction = roomCalibrated
+                ? "Point the Beam Pro camera at the detector QR."
+                : "Point the Beam Pro camera at the room reference QR.";
         }
         else if (roomPending)
         {
-            string pendingRoomId = SafeUiValue(roomCoordinateSystem.PendingRoomId, "ROOM");
-            stepTitle = "STEP 2 / 4 - PLACE ROOM ORIGIN";
-            primaryInstruction = roomPoseValid
-                ? $"{pendingRoomId}: vertical wall found. Tap PLACE ROOM."
-                : $"Aim the glasses center at {pendingRoomId} on its vertical wall.";
-            secondaryInstruction = roomPoseValid
-                ? "This fixes the room coordinate frame for this session."
-                : "PLACE ROOM unlocks when the wall pose is valid.";
+            string roomId = SafeUiValue(roomCoordinateSystem.PendingRoomId, "ROOM QR");
+            if (roomPoseValid)
+            {
+                requiredAction = "TAP PLACE ROOM";
+                requiredInstruction = $"{roomId} is aligned on the vertical wall.";
+                guideColor = new Color(0.55f, 1f, 0.68f, 1f);
+            }
+            else
+            {
+                requiredAction = "AIM AT THE ROOM QR";
+                requiredInstruction =
+                    $"Center the glasses on {roomId} attached to a vertical wall.";
+                guideColor = new Color(1f, 0.86f, 0.38f, 1f);
+            }
         }
         else if (detectorPending)
         {
             string detectorId = SafeUiValue(
                 markerManager.ActivePlacementDetectorId,
                 "DETECTOR");
-            stepTitle = "STEP 3 / 4 - PLACE DETECTOR";
-            primaryInstruction = detectorPoseValid
-                ? $"{detectorId}: gray preview aligned. Tap PLACE DETECTOR."
-                : $"Aim at {detectorId}'s real position until the gray preview appears.";
-            secondaryInstruction = detectorPoseValid
-                ? "The detector will stay fixed at this pose."
-                : "PLACE DETECTOR unlocks on a tracked surface.";
-        }
-        else if (!connected)
-        {
-            stepTitle = "STEP 1 / 4 - CONNECT SERVER";
-            if (connecting)
+            if (detectorPoseValid)
             {
-                primaryInstruction =
-                    $"Connecting to {SafeUiValue(radiationReceiver.CurrentServerIp, "server")}...";
-                secondaryInstruction = "The saved IP reconnects automatically on next launch.";
+                requiredAction = "TAP PLACE DETECTOR";
+                requiredInstruction = $"{detectorId} is aligned at the gray preview.";
+                guideColor = new Color(0.55f, 1f, 0.68f, 1f);
             }
             else
             {
-                primaryInstruction = "Check the Server IP field, then tap CONNECT & SCAN.";
-                secondaryInstruction = string.IsNullOrWhiteSpace(latestServerStatusMessage)
-                    ? "Editing the IP and pressing Done connects without opening the scanner."
-                    : CompactUiMessage(latestServerStatusMessage, 76);
+                requiredAction = "AIM AT THE DETECTOR POSITION";
+                requiredInstruction =
+                    $"Keep aiming until the gray preview for {detectorId} appears.";
+                guideColor = new Color(1f, 0.86f, 0.38f, 1f);
             }
+        }
+        else if (connecting)
+        {
+            requiredAction = "WAIT FOR SERVER CONNECTION";
+            requiredInstruction =
+                $"Connecting to {SafeUiValue(radiationReceiver.CurrentServerIp, "server")}.";
+            guideColor = new Color(1f, 0.86f, 0.38f, 1f);
+        }
+        else if (!connected)
+        {
+            requiredAction = "CONNECT SERVER";
+            requiredInstruction = "Check Server IP, then tap CONNECT & SCAN.";
+            guideColor = latestServerStatusColor.a > 0.01f
+                ? latestServerStatusColor
+                : new Color(1f, 0.55f, 0.50f, 1f);
+        }
+        else if (qrScanner == null ||
+                 markerManager == null ||
+                 roomCoordinateSystem == null)
+        {
+            requiredAction = "APP SETUP NOT READY";
+            requiredInstruction = "Restart the app before scanning a QR.";
+            guideColor = new Color(1f, 0.55f, 0.50f, 1f);
+        }
+        else if (captureBusy)
+        {
+            requiredAction = "FINISH CAMERA CAPTURE";
+            requiredInstruction = "QR scanning is locked while the capture camera is busy.";
+            guideColor = new Color(1f, 0.86f, 0.38f, 1f);
         }
         else if (!roomCalibrated)
         {
-            stepTitle = "STEP 2 / 4 - SET ROOM ORIGIN";
-            string lastRoomId = roomCoordinateSystem != null
-                ? SafeUiValue(roomCoordinateSystem.LastRoomId, "")
-                : "";
-            primaryInstruction = string.IsNullOrEmpty(lastRoomId)
-                ? "Tap SCAN ROOM QR and scan the room reference code."
-                : $"Tap SCAN ROOM QR and scan {lastRoomId} again.";
-            secondaryInstruction =
-                "Then aim at the same QR on a vertical wall and tap PLACE ROOM.";
+            string lastRoomId = SafeUiValue(roomCoordinateSystem.LastRoomId, "");
+            requiredAction = "SCAN ROOM QR";
+            requiredInstruction = string.IsNullOrEmpty(lastRoomId)
+                ? "Tap SCAN ROOM QR."
+                : $"Tap SCAN ROOM QR and scan {lastRoomId}.";
+        }
+        else if (placedCount == 0)
+        {
+            requiredAction = "ADD FIRST DETECTOR";
+            requiredInstruction = "Tap ADD DETECTOR and scan its QR.";
         }
         else if (placedCount < 4)
         {
             int remaining = 4 - placedCount;
-            stepTitle = "STEP 3 / 4 - ADD DETECTORS";
-            primaryInstruction = placedCount == 0
-                ? "Tap ADD DETECTOR and scan the first detector QR."
-                : $"{placedCount} detector(s) placed. Every detector sphere is shown independently.";
-            secondaryInstruction = placedCount == 0
-                ? "Aim at its real position, then use PLACE DETECTOR."
-                : $"Add {remaining} more only if source estimation is required.";
+            requiredAction = remaining == 1
+                ? "ADD 1 MORE DETECTOR"
+                : $"ADD {remaining} MORE DETECTORS";
+            requiredInstruction =
+                "Four placed detectors are required for source estimation.";
         }
         else if (!freshData)
         {
-            stepTitle = "STEP 4 / 4 - WAIT FOR LIVE CPS";
-            primaryInstruction = receivedRadiationThisConnection
-                ? "CPS updates stopped. Detector spheres stay hidden until data resumes."
-                : "Room and detectors are ready. Waiting for the first CPS snapshot.";
-            secondaryInstruction = "The display resumes automatically when fresh data arrives.";
+            requiredAction = receivedRadiationThisConnection
+                ? "RESTORE THE CPS STREAM"
+                : "START THE CPS STREAM";
+            requiredInstruction = receivedRadiationThisConnection
+                ? "No fresh CPS is arriving from the server."
+                : "The server must send a CPS snapshot before measurement starts.";
+            guideColor = new Color(1f, 0.78f, 0.34f, 1f);
         }
-        else
+        else if (radiationSourceEstimator != null)
         {
-            stepTitle = "STEP 4 / 4 - LIVE MEASUREMENT";
-            primaryInstruction = $"Monitoring {placedCount} placed detector(s) in real time.";
-            secondaryInstruction = BuildEstimatorInstruction();
+            switch (radiationSourceEstimator.State)
+            {
+                case RadiationSourceEstimator.EstimatorState.WaitingForDetectors:
+                    requiredAction = "CHECK LIVE CPS FOR ALL DETECTORS";
+                    requiredInstruction =
+                        "Every placed detector ID must be present in the server data.";
+                    guideColor = new Color(1f, 0.86f, 0.38f, 1f);
+                    break;
+                case RadiationSourceEstimator.EstimatorState.InsufficientGeometry:
+                    requiredAction = "REPOSITION DETECTORS";
+                    requiredInstruction =
+                        "Rescan a detector and spread positions across width, depth and height.";
+                    guideColor = new Color(1f, 0.86f, 0.38f, 1f);
+                    break;
+                case RadiationSourceEstimator.EstimatorState.OutOfSearchBounds:
+                    requiredAction = "CHECK ROOM AND DETECTOR POSITIONS";
+                    requiredInstruction =
+                        "The source estimate is outside the configured search area.";
+                    guideColor = new Color(1f, 0.86f, 0.38f, 1f);
+                    break;
+                case RadiationSourceEstimator.EstimatorState.PoorFit:
+                    requiredAction = "CHECK DETECTOR POSITIONS AND CPS";
+                    requiredInstruction =
+                        "The current readings do not produce a reliable source estimate.";
+                    guideColor = new Color(1f, 0.86f, 0.38f, 1f);
+                    break;
+            }
         }
 
-        string roomId = roomCalibrated
-            ? SafeUiValue(roomCoordinateSystem.RoomId, "SET")
-            : "NOT SET";
-        string roomSummary = $"ROOM: {roomId}  |  PLACED: {placedCount}";
-        string sourceSummary = BuildSourceSummary(placedCount, roomCalibrated);
-        string cancelSummary;
-        if (scanActive)
-            cancelSummary = "CANCEL: stops the QR scanner";
-        else if (roomPending)
-            cancelSummary = "CANCEL PLACE: cancels room placement";
-        else if (detectorPending)
-            cancelSummary = "CANCEL PLACE: removes the gray preview";
-        else if (hasUndoDetector)
-        {
-            string undoId = SafeUiValue(undoDetectorId, "last detector");
-            cancelSummary = undoWaitingForRestore
-                ? $"CANCEL PLACE: {undoId} is waiting for room restore"
-                : $"CANCEL PLACE: removes last ({undoId})";
-        }
-        else
-        {
-            cancelSummary = "CANCEL PLACE: nothing to remove";
-        }
-
-        string actionSummary =
-            !string.IsNullOrEmpty(transientActionMessage) &&
-            Time.unscaledTime < transientActionExpiresAt
-                ? "STATUS: " + CompactUiMessage(transientActionMessage, 76)
-                : cancelSummary;
-
-        string guideText =
-            serverLine + "\n" +
-            stepTitle + "\n" +
-            primaryInstruction + "\n" +
-            secondaryInstruction + "\n" +
-            roomSummary + "\n" +
-            sourceSummary + "\n" +
-            actionSummary + "\n" +
-            "FLOW: SERVER > ROOM QR > DETECTOR QR > LIVE CPS";
-
-        if (!string.IsNullOrEmpty(transientActionMessage) &&
-            Time.unscaledTime < transientActionExpiresAt)
-        {
-            guideColor = transientActionColor;
-        }
+        string guideText = string.IsNullOrWhiteSpace(requiredAction)
+            ? ""
+            : string.IsNullOrWhiteSpace(requiredInstruction)
+                ? requiredAction
+                : requiredAction + "\n" + requiredInstruction;
 
         return new WorkflowPresentation
         {
@@ -1083,56 +1078,6 @@ public class BeamProControllerBridge : MonoBehaviour
                 scanActive || roomPending || detectorPending ||
                 (connected && hasUndoDetector && !undoWaitingForRestore)
         };
-    }
-
-    private string BuildEstimatorInstruction()
-    {
-        if (radiationSourceEstimator == null)
-            return "Four or more detectors are available for source estimation.";
-
-        switch (radiationSourceEstimator.State)
-        {
-            case RadiationSourceEstimator.EstimatorState.Ready:
-                return "Source estimate ready. Use ADD DETECTOR to improve coverage.";
-            case RadiationSourceEstimator.EstimatorState.Searching:
-                return "Calculating the radiation source estimate...";
-            case RadiationSourceEstimator.EstimatorState.InsufficientGeometry:
-                return "Reposition detectors with wider 3D spacing for source estimation.";
-            case RadiationSourceEstimator.EstimatorState.OutOfSearchBounds:
-                return "Estimated source is outside the configured room search area.";
-            case RadiationSourceEstimator.EstimatorState.PoorFit:
-                return "CPS readings do not yet form a reliable single-source estimate.";
-            default:
-                return "Detector CPS is live; source estimation is waiting.";
-        }
-    }
-
-    private string BuildSourceSummary(int placedCount, bool roomCalibrated)
-    {
-        if (!roomCalibrated)
-            return "SOURCE: WAITING FOR ROOM ORIGIN";
-
-        if (placedCount < 4)
-            return $"SOURCE: NEED {4 - placedCount} MORE DETECTOR(S) - 4 MIN";
-
-        if (radiationSourceEstimator == null)
-            return "SOURCE: 4+ DETECTORS READY";
-
-        switch (radiationSourceEstimator.State)
-        {
-            case RadiationSourceEstimator.EstimatorState.Ready:
-                return "SOURCE: ESTIMATE READY";
-            case RadiationSourceEstimator.EstimatorState.Searching:
-                return "SOURCE: CALCULATING";
-            case RadiationSourceEstimator.EstimatorState.InsufficientGeometry:
-                return "SOURCE: NEED WIDER 3D SPACING";
-            case RadiationSourceEstimator.EstimatorState.OutOfSearchBounds:
-                return "SOURCE: OUTSIDE SEARCH AREA";
-            case RadiationSourceEstimator.EstimatorState.PoorFit:
-                return "SOURCE: LOW CONFIDENCE";
-            default:
-                return "SOURCE: WAITING";
-        }
     }
 
     private static string SafeUiValue(string value, string fallback)

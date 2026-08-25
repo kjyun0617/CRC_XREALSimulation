@@ -1752,9 +1752,9 @@ MonoBehaviour:
   detectorListHorizontalPadding: 20
   detectorListHeight: 320
   detectorListCenterYOffset: 330
-  workflowGuideMinFontSize: 14
-  workflowGuideMaxFontSize: 34
-  workflowGuideHeight: 320
+  workflowGuideMinFontSize: 24
+  workflowGuideMaxFontSize: 44
+  workflowGuideHeight: 220
   workflowGuideCenterYOffset: 330
   workflowButtonMinFontSize: 10
   workflowButtonMaxFontSize: 20
