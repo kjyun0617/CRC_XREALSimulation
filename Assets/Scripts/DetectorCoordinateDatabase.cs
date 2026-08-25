@@ -4,8 +4,9 @@ using System.IO;
 using UnityEngine;
 
 /// <summary>
-/// Stores detector ID, fallback world pose, QR scan metadata, last radiation value,
-/// and optional persistent spatial-anchor GUID in a JSON file.
+/// Stores detector ID, fallback Unity-world pose, stable room-relative pose,
+/// QR scan metadata, detector calibration, last radiation value, and an optional
+/// persistent spatial-anchor GUID in a JSON file.
 /// </summary>
 public class DetectorCoordinateDatabase : MonoBehaviour
 {
@@ -19,9 +20,19 @@ public class DetectorCoordinateDatabase : MonoBehaviour
     [Header("Auto Save")]
     [SerializeField] private bool autoSaveAfterEachChange = true;
 
+    [Tooltip("Live CPS snapshots are batched and persisted no more often than this interval. Coordinate/anchor changes still save immediately.")]
+    [SerializeField, Min(0.1f)] private float radiationSaveMinimumIntervalSeconds = 1f;
+
+    [Tooltip("Wait before retrying a failed JSON write so a storage error cannot stall every frame.")]
+    [SerializeField, Min(0.5f)] private float saveFailureRetryDelaySeconds = 2f;
+
     private DetectorCoordinateSaveRoot saveRoot = new DetectorCoordinateSaveRoot();
     private readonly Dictionary<string, DetectorCoordinateRecord> recordsById =
         new Dictionary<string, DetectorCoordinateRecord>(StringComparer.OrdinalIgnoreCase);
+    private bool radiationSavePending;
+    private float nextRadiationSaveTime;
+    private bool lastSaveAttemptFailed;
+    private float nextSaveRetryTime;
 
     public string SavePath => Path.Combine(Application.persistentDataPath, saveFileName);
 
@@ -38,6 +49,16 @@ public class DetectorCoordinateDatabase : MonoBehaviour
 
         if (logSavePathOnStart)
             Debug.Log($"[DetectorCoordinateDatabase] JSON path: {SavePath}");
+    }
+
+    private void Update()
+    {
+        if (radiationSavePending &&
+            autoSaveAfterEachChange &&
+            Time.unscaledTime >= nextRadiationSaveTime)
+        {
+            SaveToDisk();
+        }
     }
 
     public IReadOnlyList<DetectorCoordinateRecord> GetAllRecords()
@@ -124,6 +145,88 @@ public class DetectorCoordinateDatabase : MonoBehaviour
             SaveToDisk();
     }
 
+    /// <summary>
+    /// Saves a detector pose in the stable coordinate frame established by a
+    /// ROOM_ORIGIN QR. This is intentionally separate from the Unity-world pose:
+    /// Unity's session origin is not guaranteed to survive an app restart.
+    /// </summary>
+    public void SaveOrUpdateRoomCoordinate(
+        string detectorId,
+        string roomId,
+        Vector3 roomPosition,
+        Quaternion roomRotation,
+        float calibrationFactor = 1f)
+    {
+        DetectorCoordinateRecord record = GetOrCreateRecord(detectorId);
+        roomId = NormalizeId(roomId);
+
+        if (record == null || string.IsNullOrEmpty(roomId))
+            return;
+
+        record.roomId = roomId;
+        record.hasRoomPose = true;
+
+        record.roomPositionX = roomPosition.x;
+        record.roomPositionY = roomPosition.y;
+        record.roomPositionZ = roomPosition.z;
+
+        Quaternion normalizedRotation = NormalizeQuaternion(roomRotation);
+        record.roomRotationX = normalizedRotation.x;
+        record.roomRotationY = normalizedRotation.y;
+        record.roomRotationZ = normalizedRotation.z;
+        record.roomRotationW = normalizedRotation.w;
+
+        record.calibrationFactor = SanitizeCalibrationFactor(calibrationFactor);
+        record.roomPoseUpdatedUtc = DateTime.UtcNow.ToString("o");
+        record.updatedUtc = record.roomPoseUpdatedUtc;
+
+        if (autoSaveAfterEachChange)
+            SaveToDisk();
+    }
+
+    public bool TryGetRoomCoordinate(
+        string detectorId,
+        string roomId,
+        out Vector3 roomPosition,
+        out Quaternion roomRotation,
+        out float calibrationFactor)
+    {
+        roomPosition = Vector3.zero;
+        roomRotation = Quaternion.identity;
+        calibrationFactor = 1f;
+
+        detectorId = NormalizeId(detectorId);
+        roomId = NormalizeId(roomId);
+
+        if (!recordsById.TryGetValue(detectorId, out DetectorCoordinateRecord record) ||
+            record == null ||
+            !record.HasRoomPose(roomId))
+        {
+            return false;
+        }
+
+        roomPosition = record.GetRoomPosition();
+        roomRotation = record.GetRoomRotation();
+        calibrationFactor = SanitizeCalibrationFactor(record.calibrationFactor);
+        return true;
+    }
+
+    public void UpdateCalibrationFactor(string detectorId, float calibrationFactor)
+    {
+        detectorId = NormalizeId(detectorId);
+        if (!recordsById.TryGetValue(detectorId, out DetectorCoordinateRecord record) ||
+            record == null)
+        {
+            return;
+        }
+
+        record.calibrationFactor = SanitizeCalibrationFactor(calibrationFactor);
+        record.updatedUtc = DateTime.UtcNow.ToString("o");
+
+        if (autoSaveAfterEachChange)
+            SaveToDisk();
+    }
+
     public void ClearAnchorGuid(string detectorId)
     {
         detectorId = NormalizeId(detectorId);
@@ -141,14 +244,72 @@ public class DetectorCoordinateDatabase : MonoBehaviour
     public void UpdateRadiationValue(string detectorId, float radiationValue)
     {
         detectorId = NormalizeId(detectorId);
-        if (string.IsNullOrEmpty(detectorId))
+        if (string.IsNullOrEmpty(detectorId) ||
+            radiationValue < 0f ||
+            float.IsNaN(radiationValue) ||
+            float.IsInfinity(radiationValue))
             return;
 
         if (!recordsById.TryGetValue(detectorId, out DetectorCoordinateRecord record))
             return;
 
+        if (Mathf.Approximately(record.lastRadiationValue, radiationValue))
+            return;
+
         record.lastRadiationValue = radiationValue;
         record.lastRadiationUpdatedUtc = DateTime.UtcNow.ToString("o");
+
+        ScheduleRadiationSave();
+    }
+
+    /// <summary>
+    /// Applies one complete server snapshot and writes the JSON file at most once.
+    /// This avoids one full-file write per detector on every WebSocket update.
+    /// </summary>
+    public void UpdateRadiationValues(IReadOnlyDictionary<string, float> radiationValues)
+    {
+        if (radiationValues == null || radiationValues.Count == 0)
+            return;
+
+        string updatedUtc = DateTime.UtcNow.ToString("o");
+        bool changed = false;
+
+        foreach (var pair in radiationValues)
+        {
+            string detectorId = NormalizeId(pair.Key);
+            if (string.IsNullOrEmpty(detectorId) ||
+                pair.Value < 0f ||
+                float.IsNaN(pair.Value) ||
+                float.IsInfinity(pair.Value) ||
+                !recordsById.TryGetValue(detectorId, out DetectorCoordinateRecord record) ||
+                record == null)
+            {
+                continue;
+            }
+
+            if (Mathf.Approximately(record.lastRadiationValue, pair.Value))
+                continue;
+
+            record.lastRadiationValue = pair.Value;
+            record.lastRadiationUpdatedUtc = updatedUtc;
+            changed = true;
+        }
+
+        if (changed)
+            ScheduleRadiationSave();
+    }
+
+    public void MarkDetectorPlaced(string detectorId)
+    {
+        DetectorCoordinateRecord record = GetOrCreateRecord(detectorId);
+        if (record == null)
+            return;
+
+        long nextSequence = Math.Max(1L, saveRoot.nextPlacementSequence);
+        record.lastPlacedSequence = nextSequence;
+        record.lastPlacedUtc = DateTime.UtcNow.ToString("o");
+        record.updatedUtc = record.lastPlacedUtc;
+        saveRoot.nextPlacementSequence = nextSequence + 1L;
 
         if (autoSaveAfterEachChange)
             SaveToDisk();
@@ -181,6 +342,20 @@ public class DetectorCoordinateDatabase : MonoBehaviour
 
     public void SaveToDisk()
     {
+        SaveToDisk(false);
+    }
+
+    private void SaveToDisk(bool ignoreRetryBackoff)
+    {
+        if (!ignoreRetryBackoff &&
+            lastSaveAttemptFailed &&
+            Time.unscaledTime < nextSaveRetryTime)
+        {
+            radiationSavePending = true;
+            nextRadiationSaveTime = nextSaveRetryTime;
+            return;
+        }
+
         try
         {
             string directory = Path.GetDirectoryName(SavePath);
@@ -188,11 +363,48 @@ public class DetectorCoordinateDatabase : MonoBehaviour
                 Directory.CreateDirectory(directory);
 
             string json = JsonUtility.ToJson(saveRoot, savePrettyJson);
-            File.WriteAllText(SavePath, json);
+            string temporaryPath = SavePath + ".tmp";
+            string backupPath = SavePath + ".bak";
+
+            // The fully-written temp file remains recoverable if the process dies
+            // while the canonical path is being replaced.
+            File.WriteAllText(temporaryPath, json);
+
+            if (File.Exists(SavePath))
+            {
+                try
+                {
+                    File.Replace(temporaryPath, SavePath, backupPath, true);
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    ReplaceSaveFileWithPortableFallback(
+                        temporaryPath,
+                        backupPath);
+                }
+                catch (IOException)
+                {
+                    ReplaceSaveFileWithPortableFallback(
+                        temporaryPath,
+                        backupPath);
+                }
+            }
+            else
+            {
+                File.Move(temporaryPath, SavePath);
+            }
+
+            radiationSavePending = false;
+            lastSaveAttemptFailed = false;
             Debug.Log($"[DetectorCoordinateDatabase] Saved: {SavePath}");
         }
         catch (Exception e)
         {
+            lastSaveAttemptFailed = true;
+            radiationSavePending = true;
+            nextSaveRetryTime =
+                Time.unscaledTime + Mathf.Max(0.5f, saveFailureRetryDelaySeconds);
+            nextRadiationSaveTime = nextSaveRetryTime;
             Debug.LogError($"[DetectorCoordinateDatabase] Failed to save: {e.Message}");
         }
     }
@@ -204,19 +416,30 @@ public class DetectorCoordinateDatabase : MonoBehaviour
 
         try
         {
-            if (!File.Exists(SavePath))
+            bool hasSaveCandidate = File.Exists(SavePath) ||
+                                    File.Exists(SavePath + ".tmp") ||
+                                    File.Exists(SavePath + ".bak");
+            if (!hasSaveCandidate)
             {
                 Debug.Log($"[DetectorCoordinateDatabase] No coordinate file yet: {SavePath}");
                 return;
             }
 
-            string json = File.ReadAllText(SavePath);
-            DetectorCoordinateSaveRoot loaded = JsonUtility.FromJson<DetectorCoordinateSaveRoot>(json);
-            if (loaded == null || loaded.records == null)
-                return;
+            if (!TryFindLatestReadableSave(
+                    out string loadPath,
+                    out DetectorCoordinateSaveRoot loaded))
+            {
+                throw new InvalidDataException(
+                    "Coordinate JSON and its recovery files are invalid.");
+            }
 
+            bool recoveredSave = !string.Equals(
+                loadPath,
+                SavePath,
+                StringComparison.OrdinalIgnoreCase);
             saveRoot = loaded;
             bool sanitizedRecords = false;
+            long largestPlacementSequence = 0L;
 
             for (int i = saveRoot.records.Count - 1; i >= 0; i--)
             {
@@ -234,6 +457,20 @@ public class DetectorCoordinateDatabase : MonoBehaviour
 
                 record.detectorId = normalizedDetectorId;
 
+                if (record.calibrationFactor <= 0f ||
+                    float.IsNaN(record.calibrationFactor) ||
+                    float.IsInfinity(record.calibrationFactor))
+                {
+                    record.calibrationFactor = 1f;
+                    sanitizedRecords = true;
+                }
+
+                if (record.hasRoomPose && string.IsNullOrWhiteSpace(record.roomId))
+                {
+                    record.hasRoomPose = false;
+                    sanitizedRecords = true;
+                }
+
                 if (string.IsNullOrEmpty(record.detectorId))
                 {
                     saveRoot.records.RemoveAt(i);
@@ -248,10 +485,33 @@ public class DetectorCoordinateDatabase : MonoBehaviour
                     saveRoot.records.RemoveAt(i);
                     sanitizedRecords = true;
                 }
+
+
+                if (record.lastPlacedSequence > largestPlacementSequence)
+                    largestPlacementSequence = record.lastPlacedSequence;
             }
 
-            if (sanitizedRecords && autoSaveAfterEachChange)
+            if (saveRoot.schemaVersion < 2)
+            {
+                saveRoot.schemaVersion = 2;
+                sanitizedRecords = true;
+            }
+
+            long requiredNextSequence = Math.Max(1L, largestPlacementSequence + 1L);
+            if (saveRoot.nextPlacementSequence < requiredNextSequence)
+            {
+                saveRoot.nextPlacementSequence = requiredNextSequence;
+                sanitizedRecords = true;
+            }
+
+            if ((sanitizedRecords || recoveredSave) && autoSaveAfterEachChange)
                 SaveToDisk();
+
+            if (recoveredSave)
+            {
+                Debug.LogWarning(
+                    $"[DetectorCoordinateDatabase] Recovered coordinates from: {loadPath}");
+            }
 
             Debug.Log($"[DetectorCoordinateDatabase] Loaded records: {recordsById.Count}");
         }
@@ -267,11 +527,17 @@ public class DetectorCoordinateDatabase : MonoBehaviour
     {
         saveRoot.records.Clear();
         recordsById.Clear();
+        radiationSavePending = false;
+        lastSaveAttemptFailed = false;
 
         try
         {
             if (File.Exists(SavePath))
                 File.Delete(SavePath);
+            if (File.Exists(SavePath + ".tmp"))
+                File.Delete(SavePath + ".tmp");
+            if (File.Exists(SavePath + ".bak"))
+                File.Delete(SavePath + ".bak");
         }
         catch (Exception e)
         {
@@ -290,6 +556,7 @@ public class DetectorCoordinateDatabase : MonoBehaviour
                 $"method={record.placementMethod}, " +
                 $"anchor={record.anchorPersistentGuid}, " +
                 $"pos=({record.positionX:F3}, {record.positionY:F3}, {record.positionZ:F3}), " +
+                $"room={record.roomId}, roomPos=({record.roomPositionX:F3}, {record.roomPositionY:F3}, {record.roomPositionZ:F3}), " +
                 $"distance={record.estimatedDistanceMeters:F2}m, " +
                 $"qrPixelSize={record.qrPixelSize:F1}, " +
                 $"lastRadiation={record.lastRadiationValue:F3}, " +
@@ -302,11 +569,156 @@ public class DetectorCoordinateDatabase : MonoBehaviour
     {
         return string.IsNullOrWhiteSpace(raw) ? "" : raw.Trim();
     }
+
+    private void ScheduleRadiationSave()
+    {
+        if (!autoSaveAfterEachChange)
+            return;
+
+        if (!radiationSavePending)
+        {
+            radiationSavePending = true;
+            nextRadiationSaveTime =
+                Time.unscaledTime + Mathf.Max(0.1f, radiationSaveMinimumIntervalSeconds);
+        }
+    }
+
+    private void ReplaceSaveFileWithPortableFallback(
+        string temporaryPath,
+        string backupPath)
+    {
+        if (File.Exists(SavePath))
+            File.Copy(SavePath, backupPath, true);
+
+        if (File.Exists(SavePath))
+            File.Delete(SavePath);
+
+        File.Move(temporaryPath, SavePath);
+    }
+
+    private bool TryFindLatestReadableSave(
+        out string selectedPath,
+        out DetectorCoordinateSaveRoot selectedRoot)
+    {
+        selectedPath = "";
+        selectedRoot = null;
+        DateTime selectedWriteTime = DateTime.MinValue;
+
+        // Temp is first so equal/coarse filesystem timestamps favor the completed
+        // transaction that had not yet reached the replace step when the app died.
+        string[] candidates =
+        {
+            SavePath + ".tmp",
+            SavePath,
+            SavePath + ".bak"
+        };
+
+        for (int i = 0; i < candidates.Length; i++)
+        {
+            string candidatePath = candidates[i];
+            if (!File.Exists(candidatePath) ||
+                !TryReadSaveRoot(candidatePath, out DetectorCoordinateSaveRoot candidateRoot))
+            {
+                continue;
+            }
+
+            DateTime candidateWriteTime;
+            try
+            {
+                candidateWriteTime = File.GetLastWriteTimeUtc(candidatePath);
+            }
+            catch (Exception timeException)
+            {
+                Debug.LogWarning(
+                    $"[DetectorCoordinateDatabase] Could not read save timestamp " +
+                    $"for {candidatePath}: {timeException.Message}");
+                candidateWriteTime = DateTime.MinValue;
+            }
+
+            if (selectedRoot != null && candidateWriteTime <= selectedWriteTime)
+                continue;
+
+            selectedPath = candidatePath;
+            selectedRoot = candidateRoot;
+            selectedWriteTime = candidateWriteTime;
+        }
+
+        return selectedRoot != null;
+    }
+
+    private bool TryReadSaveRoot(
+        string path,
+        out DetectorCoordinateSaveRoot loaded)
+    {
+        loaded = null;
+
+        try
+        {
+            string json = File.ReadAllText(path);
+            loaded = JsonUtility.FromJson<DetectorCoordinateSaveRoot>(json);
+            return loaded != null && loaded.records != null;
+        }
+        catch (Exception readException)
+        {
+            Debug.LogWarning(
+                $"[DetectorCoordinateDatabase] Invalid save candidate {path}: " +
+                readException.Message);
+            loaded = null;
+            return false;
+        }
+    }
+
+    private void OnApplicationPause(bool paused)
+    {
+        if (paused && radiationSavePending && autoSaveAfterEachChange)
+            SaveToDisk(true);
+    }
+
+    private void OnApplicationQuit()
+    {
+        if (radiationSavePending && autoSaveAfterEachChange)
+            SaveToDisk(true);
+    }
+
+    private void OnDestroy()
+    {
+        if (radiationSavePending && autoSaveAfterEachChange)
+            SaveToDisk(true);
+
+        if (Instance == this)
+            Instance = null;
+    }
+
+    private float SanitizeCalibrationFactor(float value)
+    {
+        return value > 0f && !float.IsNaN(value) && !float.IsInfinity(value)
+            ? value
+            : 1f;
+    }
+
+    private Quaternion NormalizeQuaternion(Quaternion value)
+    {
+        float magnitude = Mathf.Sqrt(
+            value.x * value.x + value.y * value.y +
+            value.z * value.z + value.w * value.w);
+
+        if (magnitude < 0.0001f || float.IsNaN(magnitude) || float.IsInfinity(magnitude))
+            return Quaternion.identity;
+
+        float inverseMagnitude = 1f / magnitude;
+        return new Quaternion(
+            value.x * inverseMagnitude,
+            value.y * inverseMagnitude,
+            value.z * inverseMagnitude,
+            value.w * inverseMagnitude);
+    }
 }
 
 [Serializable]
 public class DetectorCoordinateSaveRoot
 {
+    public int schemaVersion = 2;
+    public long nextPlacementSequence = 1L;
     public List<DetectorCoordinateRecord> records = new List<DetectorCoordinateRecord>();
 }
 
@@ -329,6 +741,24 @@ public class DetectorCoordinateRecord
     public float rotationZ;
     public float rotationW = 1f;
 
+    // Stable room-relative pose. This is valid only for the matching roomId and
+    // is populated after the user calibrates a ROOM_ORIGIN QR reference frame.
+    public string roomId = "";
+    public bool hasRoomPose = false;
+
+    public float roomPositionX;
+    public float roomPositionY;
+    public float roomPositionZ;
+
+    public float roomRotationX;
+    public float roomRotationY;
+    public float roomRotationZ;
+    public float roomRotationW = 1f;
+
+    // Per-detector relative sensitivity used by the inverse-square estimator.
+    public float calibrationFactor = 1f;
+    public string roomPoseUpdatedUtc;
+
     public float estimatedDistanceMeters;
     public float qrPixelSize;
 
@@ -344,6 +774,8 @@ public class DetectorCoordinateRecord
     public string createdUtc;
     public string updatedUtc;
     public string lastRadiationUpdatedUtc;
+    public long lastPlacedSequence;
+    public string lastPlacedUtc;
 
     public Vector3 GetPosition()
     {
@@ -355,6 +787,34 @@ public class DetectorCoordinateRecord
         return new Quaternion(rotationX, rotationY, rotationZ, rotationW);
     }
 
+    public Vector3 GetRoomPosition()
+    {
+        return new Vector3(roomPositionX, roomPositionY, roomPositionZ);
+    }
+
+    public Quaternion GetRoomRotation()
+    {
+        Quaternion rotation = new Quaternion(
+            roomRotationX,
+            roomRotationY,
+            roomRotationZ,
+            roomRotationW);
+
+        float magnitude = Mathf.Sqrt(
+            rotation.x * rotation.x + rotation.y * rotation.y +
+            rotation.z * rotation.z + rotation.w * rotation.w);
+
+        if (magnitude < 0.0001f || float.IsNaN(magnitude) || float.IsInfinity(magnitude))
+            return Quaternion.identity;
+
+        float inverseMagnitude = 1f / magnitude;
+        return new Quaternion(
+            rotation.x * inverseMagnitude,
+            rotation.y * inverseMagnitude,
+            rotation.z * inverseMagnitude,
+            rotation.w * inverseMagnitude);
+    }
+
     public Vector2 GetQrImageCenter()
     {
         return new Vector2(qrImageCenterX, qrImageCenterY);
@@ -363,5 +823,17 @@ public class DetectorCoordinateRecord
     public bool HasSavedAnchor()
     {
         return anchorSaved && !string.IsNullOrWhiteSpace(anchorPersistentGuid);
+    }
+
+    public bool HasRoomPose(string expectedRoomId = null)
+    {
+        if (!hasRoomPose || string.IsNullOrWhiteSpace(roomId))
+            return false;
+
+        return string.IsNullOrWhiteSpace(expectedRoomId) ||
+               string.Equals(
+                   roomId.Trim(),
+                   expectedRoomId.Trim(),
+                   StringComparison.OrdinalIgnoreCase);
     }
 }

@@ -363,9 +363,10 @@ public class QRScanner : MonoBehaviour
         LastImageWidth = imageWidth;
         LastImageHeight = imageHeight;
 
-        bool alreadyScanned = detectorNameList.Exists(
+        bool isRoomOrigin = RoomCoordinateSystem.IsRoomOriginCode(qrText);
+        bool alreadyScanned = !isRoomOrigin && detectorNameList.Exists(
             value => string.Equals(value, qrText, StringComparison.OrdinalIgnoreCase));
-        if (rememberScannedQrTexts && !alreadyScanned)
+        if (rememberScannedQrTexts && !isRoomOrigin && !alreadyScanned)
             detectorNameList.Add(qrText);
 
         Debug.Log($"QR detected: {qrText}, center={center}, pixelSize={pixelSize:F1}, duplicate={alreadyScanned}");
@@ -383,7 +384,10 @@ public class QRScanner : MonoBehaviour
             SetPreviewVisible(false);
         }
 
-        UpdateStatus($"QR detected: {qrText}\nAim glasses at the real QR/device, then press Place.");
+        UpdateStatus(
+            isRoomOrigin
+                ? $"Room QR detected: {qrText}\nAim glasses at the wall QR, then press Place."
+                : $"QR detected: {qrText}\nAim glasses at the real QR/device, then press Place.");
 
         // Fire events even for duplicates. Re-scanning the same detector is useful for repositioning.
         OnQRDetected?.Invoke(qrText);

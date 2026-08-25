@@ -154,6 +154,8 @@ public class ARDetectorHud : MonoBehaviour
 
         RadiationReceiver.OnServerStatusChanged += HandleServerStatusChanged;
         RadiationReceiver.OnRadiationDataReceived += HandleRadiationDataReceived;
+        RadiationReceiver.OnRadiationDataFreshnessChanged +=
+            HandleRadiationDataFreshnessChanged;
         eventsSubscribed = true;
     }
 
@@ -164,6 +166,8 @@ public class ARDetectorHud : MonoBehaviour
 
         RadiationReceiver.OnServerStatusChanged -= HandleServerStatusChanged;
         RadiationReceiver.OnRadiationDataReceived -= HandleRadiationDataReceived;
+        RadiationReceiver.OnRadiationDataFreshnessChanged -=
+            HandleRadiationDataFreshnessChanged;
         eventsSubscribed = false;
     }
 
@@ -177,7 +181,10 @@ public class ARDetectorHud : MonoBehaviour
             : radiationReceiver.CurrentStatusMessage;
         serverStatusColor = radiationReceiver.CurrentStatusColor;
 
-        ReplaceLatestDeviceData(radiationReceiver.LatestDeviceData);
+        if (radiationReceiver.HasFreshRadiationData)
+            ReplaceLatestDeviceData(radiationReceiver.LatestDeviceData);
+        else
+            latestDeviceData.Clear();
     }
 
     private void HandleServerStatusChanged(string message, Color color)
@@ -197,6 +204,12 @@ public class ARDetectorHud : MonoBehaviour
     private void HandleRadiationDataReceived(Dictionary<string, float> data)
     {
         ReplaceLatestDeviceData(data);
+    }
+
+    private void HandleRadiationDataFreshnessChanged(bool isFresh)
+    {
+        if (!isFresh)
+            latestDeviceData.Clear();
     }
 
     private void ReplaceLatestDeviceData(IEnumerable<KeyValuePair<string, float>> data)

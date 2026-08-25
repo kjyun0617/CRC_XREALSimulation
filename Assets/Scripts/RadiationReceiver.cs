@@ -27,6 +27,12 @@ public class RadiationReceiver : MonoBehaviour
     public delegate void RadiationDataReceivedSignature(Dictionary<string, float> deviceData);
     public static event RadiationDataReceivedSignature OnRadiationDataReceived;
 
+    /// <summary>
+    /// False means the WebSocket may still be open, but no recent complete CPS
+    /// snapshot is available and cached readings must not be presented as live.
+    /// </summary>
+    public static event Action<bool> OnRadiationDataFreshnessChanged;
+
     public delegate void ServerStatusChangedSignature(string message, Color color);
     public static event ServerStatusChangedSignature OnServerStatusChanged;
 
@@ -46,6 +52,9 @@ public class RadiationReceiver : MonoBehaviour
     [Header("Server")]
     [SerializeField] private string defaultIp = "192.168.0.60";
     [SerializeField] private int serverPort = 5002;
+
+    [Header("Radiation Data Freshness")]
+    [SerializeField, Min(0.5f)] private float maximumDataSilenceSeconds = 5f;
 
     [Header("Saved Server Reconnection")]
     [SerializeField] private bool autoReconnectSavedServer = true;
@@ -79,6 +88,8 @@ public class RadiationReceiver : MonoBehaviour
     private bool hasSavedServerIp;
     private bool isConnecting;
     private bool isServerConnected;
+    private bool hasFreshRadiationData;
+    private float lastRadiationDataTime = float.NegativeInfinity;
     private bool hasStarted;
     private volatile bool isShuttingDown;
     private float nextAutomaticReconnectDelay;
@@ -90,6 +101,11 @@ public class RadiationReceiver : MonoBehaviour
     public string CurrentServerIp => string.IsNullOrWhiteSpace(savedIp) ? defaultIp : savedIp;
     public bool HasSavedServerIp => hasSavedServerIp;
     public bool IsConnected => isServerConnected;
+    public bool HasFreshRadiationData =>
+        IsConnected &&
+        hasFreshRadiationData &&
+        Time.unscaledTime - lastRadiationDataTime <=
+        Mathf.Max(0.5f, maximumDataSilenceSeconds);
     public bool IsConnecting => isConnecting;
     public bool IsQrScanPending => automaticQrStartExpected || qrStartCoroutine != null;
 
@@ -661,7 +677,10 @@ public class RadiationReceiver : MonoBehaviour
         latestDeviceData.Clear();
 
         if (data == null)
+        {
+            SetRadiationDataFreshness(false);
             return;
+        }
 
         foreach (var pair in data)
         {
@@ -669,6 +688,21 @@ public class RadiationReceiver : MonoBehaviour
             if (!string.IsNullOrEmpty(detectorId))
                 latestDeviceData[detectorId] = pair.Value;
         }
+
+        lastRadiationDataTime = Time.unscaledTime;
+        SetRadiationDataFreshness(true);
+    }
+
+    private void SetRadiationDataFreshness(bool fresh)
+    {
+        bool changed = hasFreshRadiationData != fresh;
+        hasFreshRadiationData = fresh;
+
+        if (!fresh)
+            lastRadiationDataTime = float.NegativeInfinity;
+
+        if (changed)
+            OnRadiationDataFreshnessChanged?.Invoke(fresh);
     }
 
     private Dictionary<string, float> CreateNormalizedDeviceData(Dictionary<string, float> data)
@@ -817,6 +851,15 @@ public class RadiationReceiver : MonoBehaviour
             }
         }
 #endif
+
+        if (hasFreshRadiationData &&
+            Time.unscaledTime - lastRadiationDataTime >
+            Mathf.Max(0.5f, maximumDataSilenceSeconds))
+        {
+            latestDeviceData.Clear();
+            SetRadiationDataFreshness(false);
+            UpdateDisplay(WaitingForDataMessage);
+        }
     }
 
     private void OnApplicationPause(bool pauseStatus)

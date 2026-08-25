@@ -1,5 +1,8 @@
+using System;
+using System.Collections.Generic;
 using TMPro;
 using UnityEngine;
+using UnityEngine.UI;
 
 /// <summary>
 /// Bridge between the Beam Pro / XREAL virtual-controller UI and scene managers.
@@ -16,11 +19,15 @@ using UnityEngine;
 public class BeamProControllerBridge : MonoBehaviour
 {
     private const string WaitingForDataMessage = "Waiting for radiation data...";
+    private const float WorkflowRefreshIntervalSeconds = 0.10f;
+    private const float ActionStatusLifetimeSeconds = 4f;
 
     [Header("Scene Managers")]
     [SerializeField] private DetectorWorldMarkerManager markerManager;
+    [SerializeField] private RoomCoordinateSystem roomCoordinateSystem;
     [SerializeField] private QRScanner qrScanner;
     [SerializeField] private RadiationReceiver radiationReceiver;
+    [SerializeField] private RadiationSourceEstimator radiationSourceEstimator;
 
     [SerializeField] private XREALCaptureManager captureManager;
     [Header("Controller UI")]
@@ -38,6 +45,20 @@ public class BeamProControllerBridge : MonoBehaviour
     [Tooltip("Text child of the Start/Stop Record button.")]
     [SerializeField] private TMP_Text controllerRecordButtonText;
 
+    [Header("Workflow Controls")]
+    [Tooltip("Optional. Auto-found by the QRScanButton name when empty.")]
+    [SerializeField] private Button controllerQrScanButton;
+
+    [Tooltip("Optional. Auto-found by the PlaceDetectorButton name when empty.")]
+    [SerializeField] private Button controllerPlaceButton;
+
+    [Tooltip("Optional. Auto-found by the CancelPlaceButton name when empty.")]
+    [SerializeField] private Button controllerCancelButton;
+
+    [SerializeField] private TMP_Text controllerQrScanButtonText;
+    [SerializeField] private TMP_Text controllerPlaceButtonText;
+    [SerializeField] private TMP_Text controllerCancelButtonText;
+
     [Header("Detector List Layout")]
     [SerializeField, Min(6f)] private float detectorListMinFontSize = 10f;
     [SerializeField, Min(10f)] private float detectorListMaxFontSize = 40f;
@@ -45,47 +66,99 @@ public class BeamProControllerBridge : MonoBehaviour
     [SerializeField, Min(128f)] private float detectorListHeight = 320f;
     [SerializeField] private float detectorListCenterYOffset = 330f;
 
+    [Header("Workflow Guide Layout")]
+    [SerializeField, Min(8f)] private float workflowGuideMinFontSize = 14f;
+    [SerializeField, Min(12f)] private float workflowGuideMaxFontSize = 34f;
+    [SerializeField, Min(128f)] private float workflowGuideHeight = 320f;
+    [SerializeField] private float workflowGuideCenterYOffset = 330f;
+    [SerializeField, Min(6f)] private float workflowButtonMinFontSize = 10f;
+    [SerializeField, Min(10f)] private float workflowButtonMaxFontSize = 20f;
+
     [Header("Behavior")]
     [SerializeField] private bool autoFindReferences = true;
     [SerializeField] private bool logActions = true;
 
+    private string latestServerStatusMessage = "";
+    private Color latestServerStatusColor = Color.white;
+    private string transientActionMessage = "";
+    private Color transientActionColor = Color.white;
+    private float transientActionExpiresAt = float.NegativeInfinity;
+    private float nextWorkflowRefreshTime;
+    private float nextReferenceResolveTime;
+    private bool workflowUiDirty = true;
+    private bool receivedRadiationThisConnection;
+    private string lastRenderedWorkflowText = "";
+
     private void Awake()
     {
         ResolveReferences();
+        ResolveControllerControls();
         ConfigureControllerDetectorList();
+        ConfigureControllerWorkflowGuide();
+        ConfigureWorkflowButtonLabels();
         SyncControllerIpField();
+        RefreshWorkflowUi(true);
     }
 
     private void OnEnable()
     {
         ResolveReferences();
+        ResolveControllerControls();
         ConfigureControllerDetectorList();
+        ConfigureControllerWorkflowGuide();
+        ConfigureWorkflowButtonLabels();
         RadiationReceiver.OnServerStatusChanged += HandleServerStatusChanged;
         RadiationReceiver.OnDisplayTextChanged += HandleDisplayTextChanged;
+        RadiationReceiver.OnServerConnectionChanged += HandleServerConnectionChanged;
+        RadiationReceiver.OnRadiationDataFreshnessChanged += HandleRadiationDataFreshnessChanged;
+        RadiationReceiver.OnRadiationDataReceived += HandleRadiationDataReceived;
+        RoomCoordinateSystem.RoomStatusChanged += HandleRoomStatusChanged;
         XREALCaptureManager.OnCaptureStateChanged += HandleCaptureStateChanged;
         RegisterControllerIpListener();
         SyncControllerIpField();
         SyncCurrentReceiverText();
+
+        receivedRadiationThisConnection =
+            radiationReceiver != null &&
+            radiationReceiver.IsConnected &&
+            radiationReceiver.HasFreshRadiationData;
+        workflowUiDirty = true;
+        nextWorkflowRefreshTime = 0f;
+        nextReferenceResolveTime = 0f;
+        RefreshWorkflowUi(true);
     }
 
     private void LateUpdate()
     {
-        if (controllerRadiationDisplayText == null)
-            return;
+        float now = Time.unscaledTime;
+        if (now >= nextReferenceResolveTime)
+        {
+            nextReferenceResolveTime = now + 1f;
+            ResolveReferences();
+            ResolveControllerControls();
+        }
 
         if (lastConfiguredScreenWidth != Screen.width ||
             lastConfiguredScreenHeight != Screen.height ||
             lastConfiguredSafeArea != Screen.safeArea)
         {
             ConfigureControllerDetectorList();
+            ConfigureControllerWorkflowGuide();
+            ConfigureWorkflowButtonLabels();
         }
+
+        if (workflowUiDirty || now >= nextWorkflowRefreshTime)
+            RefreshWorkflowUi(false);
     }
 
     private void OnDisable()
     {
         RadiationReceiver.OnServerStatusChanged -= HandleServerStatusChanged;
-
         RadiationReceiver.OnDisplayTextChanged -= HandleDisplayTextChanged;
+        RadiationReceiver.OnServerConnectionChanged -= HandleServerConnectionChanged;
+        RadiationReceiver.OnRadiationDataFreshnessChanged -= HandleRadiationDataFreshnessChanged;
+        RadiationReceiver.OnRadiationDataReceived -= HandleRadiationDataReceived;
+        RoomCoordinateSystem.RoomStatusChanged -= HandleRoomStatusChanged;
         XREALCaptureManager.OnCaptureStateChanged -= HandleCaptureStateChanged;
         if (controllerIpInputField != null)
             controllerIpInputField.onEndEdit.RemoveListener(HandleControllerIpEndEdit);
@@ -105,6 +178,8 @@ public class BeamProControllerBridge : MonoBehaviour
                     ? "Stop Record"
                     : "Start Record";
         }
+
+        workflowUiDirty = true;
     }
     /// <summary>
     /// Manually refresh manager references. Useful if objects are created after the controller prefab.
@@ -112,8 +187,12 @@ public class BeamProControllerBridge : MonoBehaviour
     public void RefreshReferences()
     {
         ResolveReferences();
+        ResolveControllerControls();
+        ConfigureControllerWorkflowGuide();
+        ConfigureWorkflowButtonLabels();
         SyncControllerIpField();
         SyncCurrentReceiverText();
+        RefreshWorkflowUi(true);
     }
 
     /// <summary>
@@ -189,21 +268,43 @@ public class BeamProControllerBridge : MonoBehaviour
         // RadiationReceiver may Awake after this prefab. Its first status update
         // is a reliable point at which the PlayerPrefs-backed address is loaded.
         SyncControllerIpField();
-
-        if (controllerStatusText == null)
-            return;
-
-        controllerStatusText.text = message;
-        controllerStatusText.color = color;
+        latestServerStatusMessage = message ?? "";
+        latestServerStatusColor = color;
+        workflowUiDirty = true;
     }
 
     private void HandleDisplayTextChanged(string message)
     {
+        workflowUiDirty = true;
         if (controllerRadiationDisplayText == null)
             return;
 
         ConfigureControllerDetectorList();
         controllerRadiationDisplayText.text = message;
+    }
+
+    private void HandleServerConnectionChanged(bool connected)
+    {
+        if (!connected)
+            receivedRadiationThisConnection = false;
+        else if (radiationReceiver != null && radiationReceiver.HasFreshRadiationData)
+            receivedRadiationThisConnection = true;
+
+        workflowUiDirty = true;
+    }
+
+    private void HandleRadiationDataFreshnessChanged(bool fresh)
+    {
+        if (fresh)
+            receivedRadiationThisConnection = true;
+
+        workflowUiDirty = true;
+    }
+
+    private void HandleRadiationDataReceived(Dictionary<string, float> _)
+    {
+        receivedRadiationThisConnection = true;
+        workflowUiDirty = true;
     }
 
     private void SyncCurrentReceiverText()
@@ -227,6 +328,13 @@ public class BeamProControllerBridge : MonoBehaviour
     public void StartQrScan()
     {
         ResolveReferences();
+
+        if ((roomCoordinateSystem != null && roomCoordinateSystem.HasPendingPlacement) ||
+            (markerManager != null && markerManager.HasActivePlacement))
+        {
+            Warn("Place or cancel the current preview before scanning another QR");
+            return;
+        }
 
         if (captureManager != null &&
             captureManager.IsBusy)
@@ -282,14 +390,39 @@ public class BeamProControllerBridge : MonoBehaviour
     {
         ResolveReferences();
 
+        if (roomCoordinateSystem != null &&
+            roomCoordinateSystem.HasPendingPlacement)
+        {
+            if (roomCoordinateSystem.TryConfirmPendingPlacement(out string roomMessage))
+            {
+                ShowControllerActionStatus(roomMessage, Color.green);
+                Log(roomMessage);
+            }
+            else
+            {
+                ShowControllerActionStatus(roomMessage, Color.yellow);
+                Warn(roomMessage);
+            }
+
+            return;
+        }
+
         if (markerManager == null)
         {
             Warn("DetectorWorldMarkerManager not found. Cannot place detector.");
             return;
         }
 
-        markerManager.PlaceDetector();
-        Log("PlaceDetector");
+        if (markerManager.TryPlaceCurrentDetector(out string detectorMessage))
+        {
+            ShowControllerActionStatus(detectorMessage, Color.green);
+            Log(detectorMessage);
+        }
+        else
+        {
+            ShowControllerActionStatus(detectorMessage, Color.yellow);
+            Warn(detectorMessage);
+        }
     }
 
     public void PlaceCurrentDetector()
@@ -305,7 +438,10 @@ public class BeamProControllerBridge : MonoBehaviour
         bool delayedScanWasPending =
             radiationReceiver != null && radiationReceiver.IsQrScanPending;
         bool scanWasActive = qrCameraWasActive || delayedScanWasPending;
-        bool placementWasActive = markerManager != null && markerManager.HasActivePlacement;
+        bool roomPlacementWasActive =
+            roomCoordinateSystem != null && roomCoordinateSystem.HasPendingPlacement;
+        bool placementWasActive = roomPlacementWasActive ||
+                                  (markerManager != null && markerManager.HasActivePlacement);
 
         if (delayedScanWasPending)
             radiationReceiver.CancelPendingQrScan();
@@ -317,6 +453,25 @@ public class BeamProControllerBridge : MonoBehaviour
         {
             ShowControllerActionStatus("QR scan cancelled", Color.white);
             Log("QR scan cancelled");
+            return;
+        }
+
+        // ROOM_ORIGIN owns Cancel while its transaction is active. Returning here
+        // is essential: cancellation must never fall through and delete the most
+        // recently committed detector.
+        if (roomPlacementWasActive && roomCoordinateSystem != null)
+        {
+            if (roomCoordinateSystem.TryCancelPendingPlacement(out string roomMessage))
+            {
+                ShowControllerActionStatus(roomMessage, Color.white);
+                Log(roomMessage);
+            }
+            else
+            {
+                ShowControllerActionStatus(roomMessage, Color.yellow);
+                Warn(roomMessage);
+            }
+
             return;
         }
 
@@ -417,16 +572,68 @@ public class BeamProControllerBridge : MonoBehaviour
         if (markerManager == null)
             markerManager = UnityEngine.Object.FindFirstObjectByType<DetectorWorldMarkerManager>();
 
+        if (roomCoordinateSystem == null)
+            roomCoordinateSystem = UnityEngine.Object.FindFirstObjectByType<RoomCoordinateSystem>();
+
         if (qrScanner == null)
             qrScanner = UnityEngine.Object.FindFirstObjectByType<QRScanner>();
 
         if (radiationReceiver == null)
             radiationReceiver = UnityEngine.Object.FindFirstObjectByType<RadiationReceiver>();
 
+        if (radiationSourceEstimator == null)
+            radiationSourceEstimator = UnityEngine.Object.FindFirstObjectByType<RadiationSourceEstimator>();
+
         if (captureManager == null)
         {
             captureManager = UnityEngine.Object.FindFirstObjectByType<XREALCaptureManager>();
         }
+    }
+
+    private void ResolveControllerControls()
+    {
+        Transform searchRoot = transform.root;
+        if (searchRoot == null)
+            return;
+
+        if (controllerQrScanButton == null)
+            controllerQrScanButton = FindButtonByName(searchRoot, "QRScanButton");
+
+        if (controllerPlaceButton == null)
+            controllerPlaceButton = FindButtonByName(searchRoot, "PlaceDetectorButton");
+
+        if (controllerCancelButton == null)
+            controllerCancelButton = FindButtonByName(searchRoot, "CancelPlaceButton");
+
+        if (controllerQrScanButtonText == null && controllerQrScanButton != null)
+            controllerQrScanButtonText = controllerQrScanButton.GetComponentInChildren<TMP_Text>(true);
+
+        if (controllerPlaceButtonText == null && controllerPlaceButton != null)
+            controllerPlaceButtonText = controllerPlaceButton.GetComponentInChildren<TMP_Text>(true);
+
+        if (controllerCancelButtonText == null && controllerCancelButton != null)
+            controllerCancelButtonText = controllerCancelButton.GetComponentInChildren<TMP_Text>(true);
+    }
+
+    private static Button FindButtonByName(Transform root, string buttonName)
+    {
+        Button[] buttons = root.GetComponentsInChildren<Button>(true);
+        for (int i = 0; i < buttons.Length; i++)
+        {
+            Button candidate = buttons[i];
+            if (candidate != null &&
+                string.Equals(candidate.name, buttonName, StringComparison.Ordinal))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private void HandleRoomStatusChanged(string message, Color color)
+    {
+        ShowControllerActionStatus(message, color);
     }
 
     private int lastConfiguredScreenWidth = -1;
@@ -483,13 +690,494 @@ public class BeamProControllerBridge : MonoBehaviour
         lastConfiguredSafeArea = safeArea;
     }
 
-    private void ShowControllerActionStatus(string message, Color color)
+    private void ConfigureControllerWorkflowGuide()
     {
         if (controllerStatusText == null)
             return;
 
-        controllerStatusText.text = message;
-        controllerStatusText.color = color;
+        float minFontSize = Mathf.Max(8f, workflowGuideMinFontSize);
+        float maxFontSize = Mathf.Max(minFontSize, workflowGuideMaxFontSize);
+
+        controllerStatusText.enableAutoSizing = true;
+        controllerStatusText.fontSizeMin = minFontSize;
+        controllerStatusText.fontSizeMax = maxFontSize;
+        controllerStatusText.fontSize = maxFontSize;
+        controllerStatusText.alignment = TextAlignmentOptions.TopLeft;
+        controllerStatusText.textWrappingMode = TextWrappingModes.Normal;
+        controllerStatusText.overflowMode = TextOverflowModes.Ellipsis;
+        controllerStatusText.richText = false;
+        controllerStatusText.raycastTarget = false;
+        controllerStatusText.margin = new Vector4(12f, 8f, 12f, 8f);
+
+        Rect safeArea = Screen.safeArea;
+        float safeLeft = 0f;
+        float safeRight = 1f;
+        if (Screen.width > 0 && safeArea.width > 0f)
+        {
+            safeLeft = Mathf.Clamp01(safeArea.xMin / Screen.width);
+            safeRight = Mathf.Clamp01(safeArea.xMax / Screen.width);
+        }
+
+        if (safeRight <= safeLeft)
+        {
+            safeLeft = 0f;
+            safeRight = 1f;
+        }
+
+        float safeMidpoint = (safeLeft + safeRight) * 0.5f;
+        RectTransform rect = controllerStatusText.rectTransform;
+        rect.anchorMin = new Vector2(safeMidpoint, 0.5f);
+        rect.anchorMax = new Vector2(safeRight, 0.5f);
+        rect.pivot = new Vector2(0.5f, 0.5f);
+        rect.anchoredPosition = new Vector2(0f, workflowGuideCenterYOffset);
+        rect.sizeDelta = new Vector2(
+            -2f * Mathf.Max(0f, detectorListHorizontalPadding),
+            Mathf.Max(128f, workflowGuideHeight));
+
+        lastConfiguredScreenWidth = Screen.width;
+        lastConfiguredScreenHeight = Screen.height;
+        lastConfiguredSafeArea = safeArea;
+    }
+
+    private void ConfigureWorkflowButtonLabels()
+    {
+        ConfigureWorkflowButtonText(controllerQrScanButtonText);
+        ConfigureWorkflowButtonText(controllerPlaceButtonText);
+        ConfigureWorkflowButtonText(controllerCancelButtonText);
+
+        if (controllerIpInputField == null)
+            return;
+
+        if (controllerIpInputField.placeholder is TMP_Text placeholderText)
+        {
+            placeholderText.text = "Server IP";
+            ConfigureSingleLineText(
+                placeholderText,
+                workflowButtonMinFontSize,
+                workflowButtonMaxFontSize);
+        }
+
+        if (controllerIpInputField.textComponent != null)
+        {
+            ConfigureSingleLineText(
+                controllerIpInputField.textComponent,
+                workflowButtonMinFontSize,
+                workflowButtonMaxFontSize);
+        }
+    }
+
+    private void ConfigureWorkflowButtonText(TMP_Text label)
+    {
+        if (label == null)
+            return;
+
+        ConfigureSingleLineText(
+            label,
+            workflowButtonMinFontSize,
+            workflowButtonMaxFontSize);
+        label.alignment = TextAlignmentOptions.Center;
+        label.margin = new Vector4(3f, 1f, 3f, 1f);
+    }
+
+    private static void ConfigureSingleLineText(
+        TMP_Text label,
+        float requestedMinFontSize,
+        float requestedMaxFontSize)
+    {
+        float minFontSize = Mathf.Max(6f, requestedMinFontSize);
+        float maxFontSize = Mathf.Max(minFontSize, requestedMaxFontSize);
+        label.enableAutoSizing = true;
+        label.fontSizeMin = minFontSize;
+        label.fontSizeMax = maxFontSize;
+        label.fontSize = maxFontSize;
+        label.textWrappingMode = TextWrappingModes.NoWrap;
+        label.overflowMode = TextOverflowModes.Ellipsis;
+        label.richText = false;
+    }
+
+    private void RefreshWorkflowUi(bool force)
+    {
+        float now = Time.unscaledTime;
+        nextWorkflowRefreshTime = now + WorkflowRefreshIntervalSeconds;
+
+        if (!string.IsNullOrEmpty(transientActionMessage) &&
+            now >= transientActionExpiresAt)
+        {
+            transientActionMessage = "";
+        }
+
+        WorkflowPresentation presentation = BuildWorkflowPresentation();
+
+        if (controllerStatusText != null &&
+            (force || !string.Equals(
+                lastRenderedWorkflowText,
+                presentation.guideText,
+                StringComparison.Ordinal)))
+        {
+            controllerStatusText.text = presentation.guideText;
+            lastRenderedWorkflowText = presentation.guideText;
+        }
+
+        if (controllerStatusText != null)
+            controllerStatusText.color = presentation.guideColor;
+
+        ApplyWorkflowButton(
+            controllerQrScanButton,
+            controllerQrScanButtonText,
+            presentation.scanLabel,
+            presentation.scanEnabled);
+        ApplyWorkflowButton(
+            controllerPlaceButton,
+            controllerPlaceButtonText,
+            presentation.placeLabel,
+            presentation.placeEnabled);
+        ApplyWorkflowButton(
+            controllerCancelButton,
+            controllerCancelButtonText,
+            presentation.cancelLabel,
+            presentation.cancelEnabled);
+
+        workflowUiDirty = false;
+    }
+
+    private static void ApplyWorkflowButton(
+        Button button,
+        TMP_Text label,
+        string labelText,
+        bool interactable)
+    {
+        if (label != null && !string.Equals(label.text, labelText, StringComparison.Ordinal))
+            label.text = labelText;
+
+        if (button != null && button.interactable != interactable)
+            button.interactable = interactable;
+    }
+
+    private WorkflowPresentation BuildWorkflowPresentation()
+    {
+        bool serverAvailable = radiationReceiver != null;
+        bool connected = serverAvailable && radiationReceiver.IsConnected;
+        bool connecting = serverAvailable && radiationReceiver.IsConnecting;
+        bool freshData = connected && radiationReceiver.HasFreshRadiationData;
+        bool roomPending =
+            roomCoordinateSystem != null && roomCoordinateSystem.HasPendingPlacement;
+        bool roomPoseValid =
+            roomPending && roomCoordinateSystem.HasValidPendingPose;
+        bool roomCalibrated =
+            roomCoordinateSystem != null && roomCoordinateSystem.IsCalibrated;
+        bool detectorPending =
+            markerManager != null && markerManager.HasActivePlacement;
+        bool detectorPoseValid =
+            detectorPending && markerManager.HasValidActivePlacementPose;
+        bool scanActive =
+            (qrScanner != null && qrScanner.IsScanActive) ||
+            (radiationReceiver != null && radiationReceiver.IsQrScanPending);
+        bool captureBusy = captureManager != null && captureManager.IsBusy;
+
+        int placedCount = markerManager != null
+            ? markerManager.CurrentRoomPlacedDetectorCount
+            : 0;
+        string undoDetectorId = "";
+        bool undoWaitingForRestore = false;
+        bool hasUndoDetector =
+            markerManager != null &&
+            markerManager.TryPeekLastPlacedDetector(
+                out undoDetectorId,
+                out undoWaitingForRestore);
+
+        string serverLine;
+        Color guideColor;
+        if (!serverAvailable)
+        {
+            serverLine = "SERVER: RECEIVER NOT FOUND";
+            guideColor = new Color(1f, 0.55f, 0.50f, 1f);
+        }
+        else if (connecting)
+        {
+            serverLine = "SERVER: CONNECTING";
+            guideColor = new Color(1f, 0.86f, 0.38f, 1f);
+        }
+        else if (!connected)
+        {
+            serverLine = "SERVER: DISCONNECTED";
+            guideColor = latestServerStatusColor.a > 0.01f
+                ? latestServerStatusColor
+                : new Color(1f, 0.55f, 0.50f, 1f);
+        }
+        else if (freshData)
+        {
+            serverLine = "SERVER: LIVE CPS";
+            guideColor = new Color(0.55f, 1f, 0.68f, 1f);
+        }
+        else if (receivedRadiationThisConnection)
+        {
+            serverLine = "SERVER: CPS STREAM STALE";
+            guideColor = new Color(1f, 0.78f, 0.34f, 1f);
+        }
+        else
+        {
+            serverLine = "SERVER: CONNECTED - WAITING FOR CPS";
+            guideColor = new Color(0.62f, 0.88f, 1f, 1f);
+        }
+
+        string stepTitle;
+        string primaryInstruction;
+        string secondaryInstruction;
+
+        if (scanActive)
+        {
+            bool scanningRoom = !roomCalibrated;
+            stepTitle = scanningRoom
+                ? "STEP 2 / 4 - SCAN ROOM QR"
+                : "STEP 3 / 4 - SCAN DETECTOR QR";
+            primaryInstruction = scanningRoom
+                ? "Point the Beam Pro camera at the room reference QR."
+                : "Point the Beam Pro camera at a detector QR.";
+            secondaryInstruction = "Tap CANCEL SCAN to stop.";
+        }
+        else if (roomPending)
+        {
+            string pendingRoomId = SafeUiValue(roomCoordinateSystem.PendingRoomId, "ROOM");
+            stepTitle = "STEP 2 / 4 - PLACE ROOM ORIGIN";
+            primaryInstruction = roomPoseValid
+                ? $"{pendingRoomId}: vertical wall found. Tap PLACE ROOM."
+                : $"Aim the glasses center at {pendingRoomId} on its vertical wall.";
+            secondaryInstruction = roomPoseValid
+                ? "This fixes the room coordinate frame for this session."
+                : "PLACE ROOM unlocks when the wall pose is valid.";
+        }
+        else if (detectorPending)
+        {
+            string detectorId = SafeUiValue(
+                markerManager.ActivePlacementDetectorId,
+                "DETECTOR");
+            stepTitle = "STEP 3 / 4 - PLACE DETECTOR";
+            primaryInstruction = detectorPoseValid
+                ? $"{detectorId}: gray preview aligned. Tap PLACE DETECTOR."
+                : $"Aim at {detectorId}'s real position until the gray preview appears.";
+            secondaryInstruction = detectorPoseValid
+                ? "The detector will stay fixed at this pose."
+                : "PLACE DETECTOR unlocks on a tracked surface.";
+        }
+        else if (!connected)
+        {
+            stepTitle = "STEP 1 / 4 - CONNECT SERVER";
+            if (connecting)
+            {
+                primaryInstruction =
+                    $"Connecting to {SafeUiValue(radiationReceiver.CurrentServerIp, "server")}...";
+                secondaryInstruction = "The saved IP reconnects automatically on next launch.";
+            }
+            else
+            {
+                primaryInstruction = "Check the Server IP field, then tap CONNECT & SCAN.";
+                secondaryInstruction = string.IsNullOrWhiteSpace(latestServerStatusMessage)
+                    ? "Editing the IP and pressing Done connects without opening the scanner."
+                    : CompactUiMessage(latestServerStatusMessage, 76);
+            }
+        }
+        else if (!roomCalibrated)
+        {
+            stepTitle = "STEP 2 / 4 - SET ROOM ORIGIN";
+            string lastRoomId = roomCoordinateSystem != null
+                ? SafeUiValue(roomCoordinateSystem.LastRoomId, "")
+                : "";
+            primaryInstruction = string.IsNullOrEmpty(lastRoomId)
+                ? "Tap SCAN ROOM QR and scan the room reference code."
+                : $"Tap SCAN ROOM QR and scan {lastRoomId} again.";
+            secondaryInstruction =
+                "Then aim at the same QR on a vertical wall and tap PLACE ROOM.";
+        }
+        else if (placedCount < 4)
+        {
+            int remaining = 4 - placedCount;
+            stepTitle = "STEP 3 / 4 - ADD DETECTORS";
+            primaryInstruction = placedCount == 0
+                ? "Tap ADD DETECTOR and scan the first detector QR."
+                : $"{placedCount} detector(s) placed. Every detector sphere is shown independently.";
+            secondaryInstruction = placedCount == 0
+                ? "Aim at its real position, then use PLACE DETECTOR."
+                : $"Add {remaining} more only if source estimation is required.";
+        }
+        else if (!freshData)
+        {
+            stepTitle = "STEP 4 / 4 - WAIT FOR LIVE CPS";
+            primaryInstruction = receivedRadiationThisConnection
+                ? "CPS updates stopped. Detector spheres stay hidden until data resumes."
+                : "Room and detectors are ready. Waiting for the first CPS snapshot.";
+            secondaryInstruction = "The display resumes automatically when fresh data arrives.";
+        }
+        else
+        {
+            stepTitle = "STEP 4 / 4 - LIVE MEASUREMENT";
+            primaryInstruction = $"Monitoring {placedCount} placed detector(s) in real time.";
+            secondaryInstruction = BuildEstimatorInstruction();
+        }
+
+        string roomId = roomCalibrated
+            ? SafeUiValue(roomCoordinateSystem.RoomId, "SET")
+            : "NOT SET";
+        string roomSummary = $"ROOM: {roomId}  |  PLACED: {placedCount}";
+        string sourceSummary = BuildSourceSummary(placedCount, roomCalibrated);
+        string cancelSummary;
+        if (scanActive)
+            cancelSummary = "CANCEL: stops the QR scanner";
+        else if (roomPending)
+            cancelSummary = "CANCEL PLACE: cancels room placement";
+        else if (detectorPending)
+            cancelSummary = "CANCEL PLACE: removes the gray preview";
+        else if (hasUndoDetector)
+        {
+            string undoId = SafeUiValue(undoDetectorId, "last detector");
+            cancelSummary = undoWaitingForRestore
+                ? $"CANCEL PLACE: {undoId} is waiting for room restore"
+                : $"CANCEL PLACE: removes last ({undoId})";
+        }
+        else
+        {
+            cancelSummary = "CANCEL PLACE: nothing to remove";
+        }
+
+        string actionSummary =
+            !string.IsNullOrEmpty(transientActionMessage) &&
+            Time.unscaledTime < transientActionExpiresAt
+                ? "STATUS: " + CompactUiMessage(transientActionMessage, 76)
+                : cancelSummary;
+
+        string guideText =
+            serverLine + "\n" +
+            stepTitle + "\n" +
+            primaryInstruction + "\n" +
+            secondaryInstruction + "\n" +
+            roomSummary + "\n" +
+            sourceSummary + "\n" +
+            actionSummary + "\n" +
+            "FLOW: SERVER > ROOM QR > DETECTOR QR > LIVE CPS";
+
+        if (!string.IsNullOrEmpty(transientActionMessage) &&
+            Time.unscaledTime < transientActionExpiresAt)
+        {
+            guideColor = transientActionColor;
+        }
+
+        return new WorkflowPresentation
+        {
+            guideText = guideText,
+            guideColor = guideColor,
+            scanLabel = scanActive
+                ? "Scanning..."
+                : !connected
+                    ? "Connect & Scan"
+                    : !roomCalibrated
+                        ? "Scan Room QR"
+                        : "Add Detector",
+            placeLabel = roomPending ? "Place Room" : "Place Detector",
+            cancelLabel = scanActive ? "Cancel Scan" : "Cancel Place",
+            scanEnabled =
+                radiationReceiver != null && qrScanner != null &&
+                !captureBusy && !scanActive && !roomPending && !detectorPending,
+            placeEnabled =
+                (roomPending && roomPoseValid) ||
+                (detectorPending && detectorPoseValid),
+            cancelEnabled =
+                scanActive || roomPending || detectorPending ||
+                (connected && hasUndoDetector && !undoWaitingForRestore)
+        };
+    }
+
+    private string BuildEstimatorInstruction()
+    {
+        if (radiationSourceEstimator == null)
+            return "Four or more detectors are available for source estimation.";
+
+        switch (radiationSourceEstimator.State)
+        {
+            case RadiationSourceEstimator.EstimatorState.Ready:
+                return "Source estimate ready. Use ADD DETECTOR to improve coverage.";
+            case RadiationSourceEstimator.EstimatorState.Searching:
+                return "Calculating the radiation source estimate...";
+            case RadiationSourceEstimator.EstimatorState.InsufficientGeometry:
+                return "Reposition detectors with wider 3D spacing for source estimation.";
+            case RadiationSourceEstimator.EstimatorState.OutOfSearchBounds:
+                return "Estimated source is outside the configured room search area.";
+            case RadiationSourceEstimator.EstimatorState.PoorFit:
+                return "CPS readings do not yet form a reliable single-source estimate.";
+            default:
+                return "Detector CPS is live; source estimation is waiting.";
+        }
+    }
+
+    private string BuildSourceSummary(int placedCount, bool roomCalibrated)
+    {
+        if (!roomCalibrated)
+            return "SOURCE: WAITING FOR ROOM ORIGIN";
+
+        if (placedCount < 4)
+            return $"SOURCE: NEED {4 - placedCount} MORE DETECTOR(S) - 4 MIN";
+
+        if (radiationSourceEstimator == null)
+            return "SOURCE: 4+ DETECTORS READY";
+
+        switch (radiationSourceEstimator.State)
+        {
+            case RadiationSourceEstimator.EstimatorState.Ready:
+                return "SOURCE: ESTIMATE READY";
+            case RadiationSourceEstimator.EstimatorState.Searching:
+                return "SOURCE: CALCULATING";
+            case RadiationSourceEstimator.EstimatorState.InsufficientGeometry:
+                return "SOURCE: NEED WIDER 3D SPACING";
+            case RadiationSourceEstimator.EstimatorState.OutOfSearchBounds:
+                return "SOURCE: OUTSIDE SEARCH AREA";
+            case RadiationSourceEstimator.EstimatorState.PoorFit:
+                return "SOURCE: LOW CONFIDENCE";
+            default:
+                return "SOURCE: WAITING";
+        }
+    }
+
+    private static string SafeUiValue(string value, string fallback)
+    {
+        string safe = string.IsNullOrWhiteSpace(value)
+            ? fallback
+            : value.Trim();
+        return CompactUiMessage(safe, 32);
+    }
+
+    private static string CompactUiMessage(string message, int maximumLength)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return "";
+
+        string compact = message
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+        if (compact.Length <= maximumLength)
+            return compact;
+
+        return compact.Substring(0, Mathf.Max(1, maximumLength - 3)) + "...";
+    }
+
+    private struct WorkflowPresentation
+    {
+        public string guideText;
+        public Color guideColor;
+        public string scanLabel;
+        public string placeLabel;
+        public string cancelLabel;
+        public bool scanEnabled;
+        public bool placeEnabled;
+        public bool cancelEnabled;
+    }
+
+    private void ShowControllerActionStatus(string message, Color color)
+    {
+        transientActionMessage = message ?? "";
+        transientActionColor = color;
+        transientActionExpiresAt =
+            Time.unscaledTime + ActionStatusLifetimeSeconds;
+        workflowUiDirty = true;
+        RefreshWorkflowUi(true);
     }
 
     private void Log(string message)
@@ -500,6 +1188,7 @@ public class BeamProControllerBridge : MonoBehaviour
 
     private void Warn(string message)
     {
+        ShowControllerActionStatus(message, Color.yellow);
         Debug.LogWarning($"[BeamProControllerBridge] {message}");
     }
 

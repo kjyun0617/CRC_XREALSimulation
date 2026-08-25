@@ -50,6 +50,22 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [SerializeField] private DetectorCoordinateDatabase coordinateDatabase;
     [SerializeField] private bool loadSavedCoordinatesOnStart = true;
 
+    [Tooltip("Create a ROOM_ORIGIN QR reference frame for stable detector coordinates across Unity sessions.")]
+    [SerializeField] private bool enableRoomCoordinateSystem = true;
+
+    [Tooltip("Optional. Created on this GameObject automatically when empty.")]
+    [SerializeField] private RoomCoordinateSystem roomCoordinateSystem;
+
+    [Tooltip("Require ROOM_ORIGIN calibration before accepting detector QR placement. This prevents session-space coordinates from entering the room database.")]
+    [SerializeField] private bool requireRoomCalibrationBeforeDetectorPlacement = true;
+
+    [Header("Source Localization")]
+    [Tooltip("Run the Phase-1 inverse-square/Poisson single-source estimator after ROOM_ORIGIN calibration.")]
+    [SerializeField] private bool enableSingleSourceEstimator = true;
+
+    [Tooltip("Optional. Created on this GameObject automatically when empty.")]
+    [SerializeField] private RadiationSourceEstimator radiationSourceEstimator;
+
     [Header("Spatial Anchor Storage")]
     [SerializeField] private bool useSpatialAnchors = false;
     [SerializeField] private DetectorSpatialAnchorManager spatialAnchorManager;
@@ -59,6 +75,11 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     [Header("Server Visibility")]
     [Tooltip("Keep every restored and placed detector hidden until the WebSocket server is connected.")]
     [SerializeField] private bool hideMarkersUntilServerConnected = true;
+
+    [Tooltip("Hide a placed detector until its ID exists in a recent complete CPS snapshot. This prevents saved values from looking live after reconnects or per-device dropouts.")]
+    [SerializeField] private bool hideMarkersWithoutFreshRadiationData = true;
+
+    [SerializeField, Min(0.5f)] private float maximumRadiationSnapshotAgeSeconds = 5f;
 
     [Tooltip("Optional. Found automatically when empty.")]
     [SerializeField] private RadiationReceiver radiationReceiver;
@@ -75,9 +96,6 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     [Tooltip("ON = after QR scan, the marker preview follows the glasses/camera center until PlaceDetector() is called.")]
     [SerializeField] private bool followPreviewCenterUntilPlaced = true;
-
-    [Tooltip("ON = save detector coordinate only when PlaceDetector() is called.")]
-    [SerializeField] private bool saveCoordinateOnlyWhenPlaced = true;
 
     [Tooltip("Label text shown while the detector preview is following the glasses/camera center.")]
     [SerializeField] private string followingStateLabel = "following gaze";
@@ -186,6 +204,9 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     private readonly Dictionary<string, MarkerInfo> markers =
         new Dictionary<string, MarkerInfo>(StringComparer.OrdinalIgnoreCase);
     private readonly List<string> sortedHudDetectorIds = new List<string>();
+    private readonly List<string> placedDetectorOrder = new List<string>();
+    private readonly HashSet<string> liveRadiationDetectorIds =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     private bool spatialEventsSubscribed = false;
     private bool warnedAboutMissingPlaneManager = false;
     private string currentFollowingDetectorId = "";
@@ -196,6 +217,9 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     private string lastInteractedDetectorId = "";
     private Shader cachedDetectorTransparentShader;
     private bool serverConnected;
+    private bool hasReceivedRadiationSnapshot;
+    private bool lastSnapshotFreshnessState;
+    private float lastRadiationSnapshotTime = float.NegativeInfinity;
 
     private enum RadiationRiskBand
     {
@@ -208,6 +232,10 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private void OnEnable()
     {
+        hasReceivedRadiationSnapshot = false;
+        lastSnapshotFreshnessState = false;
+        lastRadiationSnapshotTime = float.NegativeInfinity;
+        liveRadiationDetectorIds.Clear();
         QRScanner.OnScanStarted += NotifyQrScanStarted;
         QRScanner.OnQRDetectedDetailed += HandleQrDetected;
         RadiationReceiver.OnRadiationDataReceived += HandleRadiationDataReceived;
@@ -234,6 +262,76 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     public bool HasActivePlacement =>
         activePlacementSession != null || !string.IsNullOrEmpty(currentFollowingDetectorId);
 
+    /// <summary>
+    /// Detector currently owned by the shared Place/Cancel controls.
+    /// Exposed for the Beam Pro workflow guide only; placement remains owned here.
+    /// </summary>
+    public string ActivePlacementDetectorId =>
+        activePlacementSession != null
+            ? activePlacementSession.detectorId
+            : currentFollowingDetectorId;
+
+    /// <summary>
+    /// True when the active detector preview can be committed at its current pose.
+    /// In plane-intersection mode this becomes true only while the center gaze ray
+    /// hits a tracked plane.
+    /// </summary>
+    public bool HasValidActivePlacementPose
+    {
+        get
+        {
+            string detectorId = NormalizeDetectorId(ActivePlacementDetectorId);
+            if (string.IsNullOrEmpty(detectorId) ||
+                !markers.TryGetValue(detectorId, out MarkerInfo marker) ||
+                marker == null || marker.root == null)
+            {
+                return false;
+            }
+
+            return !usePlaneIntersectionPlacement || marker.hasValidPlaneHit;
+        }
+    }
+
+    /// <summary>
+    /// Number of committed detector visuals materialized in the currently
+    /// localized room. Hidden-by-CPS/server markers are still counted.
+    /// </summary>
+    public int CurrentRoomPlacedDetectorCount
+    {
+        get
+        {
+            int count = 0;
+            foreach (var pair in markers)
+            {
+                MarkerInfo marker = pair.Value;
+                if (marker != null && marker.root != null && marker.isPlaced)
+                    count++;
+            }
+
+            return count;
+        }
+    }
+
+    /// <summary>
+    /// Peeks the same LIFO detector that Cancel Place will remove without changing
+    /// any marker or saved coordinate state.
+    /// </summary>
+    public bool TryPeekLastPlacedDetector(
+        out string detectorId,
+        out bool waitingForRestore)
+    {
+        bool found = TryGetMostRecentlyPlacedDetector(
+            out detectorId,
+            out string pendingDetectorId);
+
+        waitingForRestore =
+            !found && !string.IsNullOrEmpty(pendingDetectorId);
+        if (waitingForRestore)
+            detectorId = pendingDetectorId;
+
+        return found || waitingForRestore;
+    }
+
     public void NotifyQrScanStarted()
     {
         // Starting a new scan invalidates the old one-step delete token. Cancel
@@ -246,10 +344,13 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         EnsurePlacementOrigin();
         EnsurePlaneDetectionManager();
         EnsureCoordinateDatabase();
+        EnsureRoomCoordinateSystem();
+        EnsureRadiationSourceEstimator();
         EnsureSpatialAnchorManager();
         EnsureRadiationReceiver();
         SubscribeSpatialEvents();
         EnsureArGlassesHud();
+        InitializePlacedDetectorOrderFromDatabase();
 
         SetServerConnectionState(radiationReceiver != null && radiationReceiver.IsConnected);
 
@@ -259,6 +360,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private void LateUpdate()
     {
+        RefreshRadiationSnapshotVisibilityIfExpired();
         EnsurePlacementOrigin();
         UpdateFollowingMarkerPosition();
 
@@ -273,6 +375,31 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
     private void HandleQrDetected(string qrText, Vector2 imageCenter, int imageWidth, int imageHeight, float qrPixelSize)
     {
+        // ROOM_ORIGIN is a coordinate-frame command, not a radiation detector ID.
+        // RoomCoordinateSystem owns its preview/confirmation transaction.
+        if (RoomCoordinateSystem.IsRoomOriginCode(qrText))
+        {
+            CancelActivePlacementOnly();
+            return;
+        }
+
+        if (roomCoordinateSystem != null)
+            roomCoordinateSystem.CancelPendingPlacementForDetectorScan();
+
+        if (enableRoomCoordinateSystem &&
+            requireRoomCalibrationBeforeDetectorPlacement &&
+            (roomCoordinateSystem == null || !roomCoordinateSystem.IsCalibrated))
+        {
+            CancelActivePlacementOnly();
+            Debug.LogWarning(
+                "[DetectorWorldMarkerManager] Detector QR ignored until ROOM_ORIGIN " +
+                "is scanned and placed on its vertical wall.");
+            RoomCoordinateSystem.PublishStatus(
+                "Place ROOM_ORIGIN before scanning detectors",
+                Color.yellow);
+            return;
+        }
+
         string detectorId = NormalizeDetectorId(qrText);
         if (string.IsNullOrEmpty(detectorId))
             return;
@@ -355,10 +482,11 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         lastInteractedDetectorId = marker.detectorId;
         UpdateMarkerVisual(marker, marker.lastRadiationValue);
 
-        if (!saveCoordinateOnlyWhenPlaced)
-        {
-            SaveCoordinate(detectorId, worldPosition, worldRotation, estimatedDistance, qrPixelSize, placementImagePoint, imageWidth, imageHeight, placementMethod);
-        }
+        // This branch commits immediately, so it is already a placed detector.
+        // Persist it regardless of whether the button-driven flow is configured to
+        // defer saves until its Place action.
+        SaveCoordinate(detectorId, worldPosition, worldRotation, estimatedDistance, qrPixelSize, placementImagePoint, imageWidth, imageHeight, placementMethod);
+        RecordPlacedDetector(marker.detectorId, true);
 
         FinalizeSpatialBinding(detectorId, marker, worldPosition, worldRotation);
 
@@ -646,7 +774,9 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     private bool TryGetGazePlaneIntersection(
         out Vector3 hitPosition,
         out Quaternion hitRotation,
-        out float hitDistance)
+        out float hitDistance,
+        bool requireVerticalSurface = false,
+        float maximumVerticalNormalDot = 0.35f)
     {
         hitPosition = Vector3.zero;
         hitRotation = Quaternion.identity;
@@ -673,6 +803,17 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                 continue;
 
             Vector3 planeNormal = plane.transform.up;
+
+            // ROOM_ORIGIN must use a wall. Filter candidates before choosing the
+            // nearest intersection; otherwise a nearer floor can permanently mask
+            // the valid wall behind it.
+            if (requireVerticalSurface &&
+                Mathf.Abs(Vector3.Dot(planeNormal.normalized, Vector3.up)) >
+                Mathf.Clamp01(maximumVerticalNormalDot))
+            {
+                continue;
+            }
+
             float denominator = Vector3.Dot(gazeRay.direction, planeNormal);
             if (Mathf.Abs(denominator) < 0.0001f)
                 continue;
@@ -746,15 +887,46 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                Mathf.Abs(pointFromCenter.y) <= halfSize.y;
     }
 
-    public void PlaceDetector()
+    public bool TryPlaceCurrentDetector(out string resultMessage)
     {
-        if (string.IsNullOrEmpty(currentFollowingDetectorId))
+        string detectorId = NormalizeDetectorId(ActivePlacementDetectorId);
+        if (string.IsNullOrEmpty(detectorId))
         {
-            Debug.LogWarning("[DetectorWorldMarkerManager] PlaceDetector called, but no detector preview is following the view center.");
-            return;
+            resultMessage = "Scan a detector QR before placing";
+            return false;
         }
 
-        PlaceDetector(currentFollowingDetectorId);
+        if (!markers.TryGetValue(detectorId, out MarkerInfo marker) ||
+            marker == null || marker.root == null)
+        {
+            resultMessage = $"Detector preview not found: {detectorId}";
+            return false;
+        }
+
+        if (marker.isFollowingPlacementOrigin && !marker.isPlaced)
+            UpdateFollowingMarkerPosition(marker);
+
+        if (usePlaneIntersectionPlacement && !marker.hasValidPlaneHit)
+        {
+            resultMessage =
+                $"Aim the glasses center at a detected surface for {marker.detectorId}";
+            return false;
+        }
+
+        PlaceDetector(marker.detectorId);
+        bool placed = marker.isPlaced && !marker.isFollowingPlacementOrigin;
+        resultMessage = placed
+            ? $"Detector placed: {marker.detectorId}"
+            : $"Detector could not be placed: {marker.detectorId}";
+        return placed;
+    }
+
+    public void PlaceDetector()
+    {
+        if (!TryPlaceCurrentDetector(out string resultMessage))
+        {
+            Debug.LogWarning($"[DetectorWorldMarkerManager] {resultMessage}");
+        }
     }
 
     public void PlaceCurrentDetector()
@@ -836,6 +1008,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             marker.lastImageHeight,
             placementMethod
         );
+        RecordPlacedDetector(detectorId, true);
 
         FinalizeSpatialBinding(detectorId, marker, marker.savedPosition, worldRotation);
 
@@ -870,11 +1043,25 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             return true;
         }
 
-        // Preserve the existing controller behavior: immediately after a successful
-        // placement, Cancel Place removes that exact detector. The active-session
-        // branch above prevents it from deleting some other committed detector while
-        // a different preview is being edited.
-        string detectorId = NormalizeDetectorId(lastInteractedDetectorId);
+        // Remove committed detectors in reverse placement order. Starting/cancelling
+        // a later QR scan does not erase this stack, so repeated Cancel Place presses
+        // remove C, then B, then A without requiring gaze selection.
+        string detectorId = "";
+        TryGetMostRecentlyPlacedDetector(
+            out detectorId,
+            out string pendingDetectorId);
+
+        if (string.IsNullOrEmpty(detectorId) &&
+            !string.IsNullOrEmpty(pendingDetectorId))
+        {
+            resultMessage =
+                $"Latest detector is waiting for ROOM_ORIGIN/anchor restore: {pendingDetectorId}";
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(detectorId))
+            detectorId = NormalizeDetectorId(lastInteractedDetectorId);
+
         lastInteractedDetectorId = "";
 
         if (string.IsNullOrEmpty(detectorId))
@@ -983,6 +1170,148 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         return true;
     }
 
+    /// <summary>
+    /// Cancels only an active preview transaction. It never falls through to the
+    /// committed-detector LIFO removal path.
+    /// </summary>
+    public bool CancelActivePlacementOnly()
+    {
+        if (activePlacementSession == null &&
+            string.IsNullOrEmpty(currentFollowingDetectorId))
+        {
+            return false;
+        }
+
+        RollbackActivePlacementSession();
+        lastInteractedDetectorId = "";
+        return true;
+    }
+
+    /// <summary>
+    /// Exposes the same center-gaze/AR-plane pose used by detector placement so a
+    /// ROOM_ORIGIN calibration cannot drift from the detector placement method.
+    /// </summary>
+    public bool TryGetCurrentGazePlanePose(
+        out Vector3 hitPosition,
+        out Quaternion hitRotation,
+        out Vector3 surfaceNormal,
+        out float hitDistance,
+        bool requireVerticalSurface = false,
+        float maximumVerticalNormalDot = 0.35f)
+    {
+        bool found = TryGetGazePlaneIntersection(
+            out hitPosition,
+            out hitRotation,
+            out hitDistance,
+            requireVerticalSurface,
+            maximumVerticalNormalDot);
+
+        surfaceNormal = found
+            ? (hitRotation * Vector3.up).normalized
+            : Vector3.zero;
+        return found;
+    }
+
+    private void InitializePlacedDetectorOrderFromDatabase()
+    {
+        placedDetectorOrder.Clear();
+
+        if (!useCoordinateDatabase || coordinateDatabase == null)
+            return;
+
+        IReadOnlyList<DetectorCoordinateRecord> records = coordinateDatabase.GetAllRecords();
+        List<DetectorCoordinateRecord> sequencedRecords =
+            new List<DetectorCoordinateRecord>();
+
+        // Legacy JSON has no sequence. Preserve its existing order, then append
+        // records that have an explicit persisted placement sequence.
+        for (int i = 0; i < records.Count; i++)
+        {
+            DetectorCoordinateRecord record = records[i];
+            if (record == null || string.IsNullOrWhiteSpace(record.detectorId))
+                continue;
+
+            if (record.lastPlacedSequence > 0L)
+                sequencedRecords.Add(record);
+            else
+                RecordPlacedDetector(record.detectorId);
+        }
+
+        sequencedRecords.Sort((left, right) =>
+            left.lastPlacedSequence.CompareTo(right.lastPlacedSequence));
+
+        for (int i = 0; i < sequencedRecords.Count; i++)
+            RecordPlacedDetector(sequencedRecords[i].detectorId);
+    }
+
+    private void RecordPlacedDetector(string detectorId, bool persistOrder = false)
+    {
+        detectorId = NormalizeDetectorId(detectorId);
+        if (string.IsNullOrEmpty(detectorId))
+            return;
+
+        RemoveFromPlacedDetectorOrder(detectorId);
+        placedDetectorOrder.Add(detectorId);
+
+        if (persistOrder && useCoordinateDatabase && coordinateDatabase != null)
+            coordinateDatabase.MarkDetectorPlaced(detectorId);
+    }
+
+    private bool TryGetMostRecentlyPlacedDetector(
+        out string detectorId,
+        out string pendingDetectorId)
+    {
+        detectorId = "";
+        pendingDetectorId = "";
+
+        for (int i = placedDetectorOrder.Count - 1; i >= 0; i--)
+        {
+            string candidateId = NormalizeDetectorId(placedDetectorOrder[i]);
+            if (markers.TryGetValue(candidateId, out MarkerInfo marker) &&
+                marker != null && marker.root != null && marker.isPlaced)
+            {
+                detectorId = marker.detectorId;
+                return true;
+            }
+
+            if (coordinateDatabase != null &&
+                coordinateDatabase.TryGetRecord(
+                    candidateId,
+                    out DetectorCoordinateRecord pendingRecord) &&
+                pendingRecord != null)
+            {
+                // Records from another named room do not participate in this
+                // room's LIFO stack.
+                if (roomCoordinateSystem != null &&
+                    roomCoordinateSystem.IsCalibrated &&
+                    pendingRecord.HasRoomPose() &&
+                    !pendingRecord.HasRoomPose(roomCoordinateSystem.RoomId))
+                {
+                    continue;
+                }
+
+                // Do not skip over the newest detector while its asynchronous
+                // anchor/room restoration is pending and delete an older one.
+                pendingDetectorId = pendingRecord.detectorId;
+                return false;
+            }
+
+            placedDetectorOrder.RemoveAt(i);
+        }
+
+        return false;
+    }
+
+    private void RemoveFromPlacedDetectorOrder(string detectorId)
+    {
+        detectorId = NormalizeDetectorId(detectorId);
+        for (int i = placedDetectorOrder.Count - 1; i >= 0; i--)
+        {
+            if (DetectorIdsEqual(placedDetectorOrder[i], detectorId))
+                placedDetectorOrder.RemoveAt(i);
+        }
+    }
+
     private bool RemoveDetectorAndSavedData(string detectorId)
     {
         detectorId = NormalizeDetectorId(detectorId);
@@ -998,6 +1327,7 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         marker.isFollowingPlacementOrigin = false;
         marker.isPlaced = false;
         markers.Remove(detectorId);
+        RemoveFromPlacedDetectorOrder(detectorId);
 
         if (marker.root != null)
             SetMarkerRequestedVisibility(marker, false);
@@ -1159,6 +1489,35 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         }
     }
 
+    private void EnsureRoomCoordinateSystem()
+    {
+        if (!enableRoomCoordinateSystem)
+            return;
+
+        if (roomCoordinateSystem == null)
+            roomCoordinateSystem = GetComponent<RoomCoordinateSystem>();
+
+        if (roomCoordinateSystem == null)
+            roomCoordinateSystem = gameObject.AddComponent<RoomCoordinateSystem>();
+
+        roomCoordinateSystem.Initialize(this, coordinateDatabase, fallbackCamera);
+    }
+
+    private void EnsureRadiationSourceEstimator()
+    {
+        if (!enableSingleSourceEstimator)
+            return;
+
+        if (radiationSourceEstimator == null)
+            radiationSourceEstimator = GetComponent<RadiationSourceEstimator>();
+
+        if (radiationSourceEstimator == null)
+            radiationSourceEstimator = gameObject.AddComponent<RadiationSourceEstimator>();
+
+        if (roomCoordinateSystem != null && roomCoordinateSystem.IsCalibrated)
+            radiationSourceEstimator.SetCoordinateFrame(roomCoordinateSystem.CoordinateFrame);
+    }
+
     private void EnsureRadiationReceiver()
     {
         if (radiationReceiver == null)
@@ -1221,7 +1580,26 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         Vector3 worldPosition,
         Quaternion worldRotation)
     {
-        if (!useSpatialAnchors || marker == null)
+        if (marker == null)
+            return;
+
+
+        // Once a stable room pose exists, ROOM_ORIGIN is the single authoritative
+        // reference frame. Do not create a second detector-local pose source.
+        if (roomCoordinateSystem != null && roomCoordinateSystem.IsCalibrated)
+        {
+            if (marker.root != null)
+                marker.root.transform.SetParent(transform, true);
+
+            if (spatialAnchorManager != null)
+                spatialAnchorManager.InvalidatePendingOperationForDetector(detectorId);
+
+            marker.anchor = null;
+            marker.anchorState = "room coordinate saved";
+            return;
+        }
+
+        if (!useSpatialAnchors)
             return;
 
         // Detach the marker while the replacement anchor is being created. The
@@ -1254,6 +1632,18 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (anchor == null || IsActivePlacementForDetector(detectorId))
             return;
 
+        if (HasStoredRoomPose(detectorId))
+        {
+            if (markers.TryGetValue(detectorId, out MarkerInfo roomMarker) &&
+                roomMarker != null)
+            {
+                roomMarker.anchor = null;
+                roomMarker.anchorState = "room coordinate saved";
+            }
+
+            return;
+        }
+
         if (!markers.TryGetValue(detectorId, out MarkerInfo marker) || marker == null)
             return;
 
@@ -1283,6 +1673,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
     {
         detectorId = NormalizeDetectorId(detectorId);
         if (anchor == null || IsActivePlacementForDetector(detectorId))
+            return;
+
+        // A room-relative record is restored only after ROOM_ORIGIN is localized.
+        // Loading its older detector-local anchor here would create a startup ghost
+        // and later fight the authoritative room transform.
+        if (HasStoredRoomPose(detectorId))
             return;
 
         MarkerInfo marker = CreateOrMoveMarker(
@@ -1321,6 +1717,24 @@ public class DetectorWorldMarkerManager : MonoBehaviour
             restoredRadiationValue = record.lastRadiationValue;
         }
 
+        // The room may have been calibrated while this asynchronous legacy anchor
+        // was still loading. Capture it now so it is not omitted from the estimator
+        // or the next room-relative restoration, then detach the visual from the
+        // legacy per-detector pose source.
+        if (roomCoordinateSystem != null && roomCoordinateSystem.IsCalibrated)
+        {
+            SaveRoomCoordinateIfCalibrated(
+                detectorId,
+                anchor.transform.position,
+                anchor.transform.rotation);
+
+            if (marker.root != null)
+                marker.root.transform.SetParent(transform, true);
+
+            marker.anchor = null;
+            marker.anchorState = "room coordinate captured";
+        }
+
         UpdateMarkerVisual(
             marker,
             GetLatestRadiationValue(detectorId, restoredRadiationValue));
@@ -1348,6 +1762,14 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (IsActivePlacementForDetector(detectorId))
             return;
 
+        if (HasStoredRoomPose(detectorId))
+        {
+            Debug.LogWarning(
+                $"[DetectorWorldMarkerManager] Legacy anchor load failed for {detectorId}; " +
+                $"ROOM_ORIGIN calibration will restore its room-relative pose. {message}");
+            return;
+        }
+
         // A serialized Unity world pose is session-relative and is not the same
         // physical location after an app restart. Do not show that coordinate as a
         // fallback; it creates the startup "ghost" sphere and can visibly jump once
@@ -1373,6 +1795,16 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         bool changed = serverConnected != connected;
         serverConnected = connected;
 
+        if (changed)
+        {
+            // A snapshot from the previous WebSocket generation must never make
+            // restored detector values look live on the replacement connection.
+            hasReceivedRadiationSnapshot = false;
+            lastSnapshotFreshnessState = false;
+            lastRadiationSnapshotTime = float.NegativeInfinity;
+            liveRadiationDetectorIds.Clear();
+        }
+
         foreach (var pair in markers)
             ApplyMarkerVisibility(pair.Value);
 
@@ -1390,16 +1822,37 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (data == null)
             return;
 
+        hasReceivedRadiationSnapshot = true;
+        lastRadiationSnapshotTime = Time.unscaledTime;
+        liveRadiationDetectorIds.Clear();
+
         foreach (var kvp in data)
         {
             string detectorId = NormalizeDetectorId(kvp.Key);
 
+            if (string.IsNullOrEmpty(detectorId) ||
+                kvp.Value < 0f ||
+                float.IsNaN(kvp.Value) ||
+                float.IsInfinity(kvp.Value))
+            {
+                continue;
+            }
+
+            liveRadiationDetectorIds.Add(detectorId);
+
             if (markers.TryGetValue(detectorId, out MarkerInfo marker))
                 UpdateMarkerVisual(marker, kvp.Value);
-
-            if (useCoordinateDatabase && coordinateDatabase != null)
-                coordinateDatabase.UpdateRadiationValue(detectorId, kvp.Value);
         }
+
+        lastSnapshotFreshnessState = IsRadiationSnapshotFresh();
+
+        // A complete server snapshot can omit a detector that was present in the
+        // preceding snapshot. Re-evaluate every marker so that detector is hidden.
+        foreach (var pair in markers)
+            ApplyMarkerVisibility(pair.Value);
+
+        if (useCoordinateDatabase && coordinateDatabase != null)
+            coordinateDatabase.UpdateRadiationValues(data);
     }
 
     private MarkerInfo CreateOrMoveMarker(
@@ -1945,16 +2398,28 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         if (marker == null)
             return;
 
+        bool isPreview = IsPreviewMarker(marker);
+
         // The preview is a placement aid, not a measurement, so it does not have to
         // wait for the radiation server. Otherwise the sphere the user is aiming with
         // is invisible during an offline or not-yet-connected placement.
         bool previewIgnoresServerGate =
-            showPreviewBeforeServerConnected && IsPreviewMarker(marker);
+            showPreviewBeforeServerConnected && isPreview;
+
+        bool serverReady = !hideMarkersUntilServerConnected || serverConnected;
+        bool roomReady = isPreview ||
+                         !enableRoomCoordinateSystem ||
+                         !requireRoomCalibrationBeforeDetectorPlacement ||
+                         (roomCoordinateSystem != null && roomCoordinateSystem.IsCalibrated);
+        bool radiationReady = isPreview ||
+                              !hideMarkersWithoutFreshRadiationData ||
+                              (IsRadiationSnapshotFresh() &&
+                               liveRadiationDetectorIds.Contains(marker.detectorId));
 
         bool visible = marker.visibilityRequested &&
-                       (previewIgnoresServerGate ||
-                        !hideMarkersUntilServerConnected ||
-                        serverConnected);
+                       roomReady &&
+                       radiationReady &&
+                       (previewIgnoresServerGate || serverReady);
 
         if (marker.root != null)
             marker.root.SetActive(visible);
@@ -1978,6 +2443,25 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
         if (showLabel && marker.label != null)
             marker.label.gameObject.SetActive(visible);
+    }
+
+    private bool IsRadiationSnapshotFresh()
+    {
+        return serverConnected &&
+               hasReceivedRadiationSnapshot &&
+               Time.unscaledTime - lastRadiationSnapshotTime <=
+               Mathf.Max(0.5f, maximumRadiationSnapshotAgeSeconds);
+    }
+
+    private void RefreshRadiationSnapshotVisibilityIfExpired()
+    {
+        bool snapshotIsFresh = IsRadiationSnapshotFresh();
+        if (snapshotIsFresh == lastSnapshotFreshnessState)
+            return;
+
+        lastSnapshotFreshnessState = snapshotIsFresh;
+        foreach (var pair in markers)
+            ApplyMarkerVisibility(pair.Value);
     }
 
     private Material SetRendererTransparentColor(
@@ -2137,6 +2621,11 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                 placementMethod
             );
 
+            SaveRoomCoordinateIfCalibrated(
+                detectorId,
+                worldPosition,
+                worldRotation);
+
             // A server snapshot may have arrived before this detector's first
             // coordinate record existed. Persist the value used by the marker now
             // so an app restart does not fall back to an unknown/hidden reading.
@@ -2152,6 +2641,45 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                     marker.lastRadiationValue);
             }
         }
+    }
+
+    private bool HasStoredRoomPose(string detectorId)
+    {
+        return coordinateDatabase != null &&
+               coordinateDatabase.TryGetRecord(detectorId, out DetectorCoordinateRecord record) &&
+               record != null &&
+               record.HasRoomPose();
+    }
+
+    private void SaveRoomCoordinateIfCalibrated(
+        string detectorId,
+        Vector3 worldPosition,
+        Quaternion worldRotation)
+    {
+        if (!useCoordinateDatabase ||
+            coordinateDatabase == null ||
+            roomCoordinateSystem == null ||
+            !roomCoordinateSystem.IsCalibrated)
+        {
+            return;
+        }
+
+        float calibrationFactor = 1f;
+        if (coordinateDatabase.TryGetRecord(detectorId, out DetectorCoordinateRecord record) &&
+            record != null &&
+            record.calibrationFactor > 0f &&
+            !float.IsNaN(record.calibrationFactor) &&
+            !float.IsInfinity(record.calibrationFactor))
+        {
+            calibrationFactor = record.calibrationFactor;
+        }
+
+        coordinateDatabase.SaveOrUpdateRoomCoordinate(
+            detectorId,
+            roomCoordinateSystem.RoomId,
+            roomCoordinateSystem.WorldToRoomPoint(worldPosition),
+            roomCoordinateSystem.WorldToRoomRotation(worldRotation),
+            calibrationFactor);
     }
 
     private void LoadSavedCoordinatesWithoutAnchors()
@@ -2194,6 +2722,13 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                 if (record == null || string.IsNullOrWhiteSpace(record.detectorId))
                     continue;
 
+                if (record.HasRoomPose())
+                {
+                    // A room-local coordinate has no valid Unity-world pose until
+                    // the user localizes ROOM_ORIGIN in this session.
+                    continue;
+                }
+
                 MarkerInfo marker = CreateOrMoveMarker(record.detectorId, record.GetPosition(), record.estimatedDistanceMeters, record.qrPixelSize, null);
 
                 if (marker != null)
@@ -2214,6 +2749,212 @@ public class DetectorWorldMarkerManager : MonoBehaviour
 
             Debug.Log($"[DetectorWorldMarkerManager] Loaded fallback markers from coordinate database: {records.Count}");
         }
+    }
+
+    /// <summary>
+    /// Writes every currently materialized detector into the calibrated room frame.
+    /// Hidden-by-server markers are included because visibility is unrelated to pose.
+    /// </summary>
+    public int CapturePlacedDetectorRoomCoordinates(RoomCoordinateSystem roomFrame)
+    {
+        if (roomFrame == null ||
+            !roomFrame.IsCalibrated ||
+            coordinateDatabase == null)
+        {
+            return 0;
+        }
+
+        int savedCount = 0;
+        foreach (var pair in markers)
+        {
+            MarkerInfo marker = pair.Value;
+            if (marker == null || marker.root == null || !marker.isPlaced)
+                continue;
+
+            // Never reinterpret a detector already assigned to a room. A room
+            // re-scan refines the frame, not the detector's stored local pose.
+            if (coordinateDatabase.TryGetRecord(
+                    marker.detectorId,
+                    out DetectorCoordinateRecord existingRecord) &&
+                existingRecord != null &&
+                existingRecord.HasRoomPose())
+            {
+                continue;
+            }
+
+            SaveRoomCoordinateIfCalibrated(
+                marker.detectorId,
+                marker.root.transform.position,
+                marker.root.transform.rotation);
+            savedCount++;
+        }
+
+        return savedCount;
+    }
+
+    /// <summary>
+    /// Materializes detectors that could not be restored by their persistent XREAL
+    /// anchor, using the newly calibrated ROOM_ORIGIN frame. Existing anchored
+    /// markers are deliberately left untouched; the room pose is a safe fallback,
+    /// not an offset applied on top of a working anchor.
+    /// </summary>
+    public int RestoreMissingMarkersFromRoomCoordinates(RoomCoordinateSystem roomFrame)
+    {
+        if (roomFrame == null ||
+            !roomFrame.IsCalibrated ||
+            coordinateDatabase == null)
+        {
+            return 0;
+        }
+
+        IReadOnlyList<DetectorCoordinateRecord> records = coordinateDatabase.GetAllRecords();
+        int restoredCount = 0;
+
+        // Markers belonging to another calibrated room must not leak into the
+        // active room. Remove only their runtime visuals; saved DB/anchor data is
+        // kept so switching back to that room remains possible.
+        List<string> markersOutsideRoom = new List<string>();
+        foreach (var pair in markers)
+        {
+            if (!coordinateDatabase.TryGetRecord(
+                    pair.Key,
+                    out DetectorCoordinateRecord markerRecord) ||
+                markerRecord == null ||
+                !markerRecord.HasRoomPose() ||
+                markerRecord.HasRoomPose(roomFrame.RoomId))
+            {
+                continue;
+            }
+
+            markersOutsideRoom.Add(pair.Key);
+        }
+
+        for (int i = 0; i < markersOutsideRoom.Count; i++)
+        {
+            string detectorId = markersOutsideRoom[i];
+            if (!markers.TryGetValue(detectorId, out MarkerInfo marker) || marker == null)
+                continue;
+
+            markers.Remove(detectorId);
+            DestroyMarkerVisualResources(marker);
+            if (marker.root != null)
+                Destroy(marker.root);
+        }
+
+        for (int i = 0; i < records.Count; i++)
+        {
+            DetectorCoordinateRecord record = records[i];
+            if (record == null ||
+                string.IsNullOrWhiteSpace(record.detectorId) ||
+                !record.HasRoomPose(roomFrame.RoomId))
+            {
+                continue;
+            }
+
+            string detectorId = NormalizeDetectorId(record.detectorId);
+            markers.TryGetValue(detectorId, out MarkerInfo existing);
+            if (existing != null && existing.root == null)
+            {
+                DestroyMarkerVisualResources(existing);
+                markers.Remove(detectorId);
+                existing = null;
+            }
+
+            Vector3 worldPosition = roomFrame.RoomToWorldPoint(record.GetRoomPosition());
+            Quaternion worldRotation =
+                roomFrame.RoomToWorldRotation(record.GetRoomRotation());
+
+            MarkerInfo marker = existing;
+            bool newlyRestored = marker == null;
+            if (newlyRestored)
+            {
+                marker = CreateOrMoveMarker(
+                    detectorId,
+                    worldPosition,
+                    record.estimatedDistanceMeters,
+                    record.qrPixelSize,
+                    null,
+                    true);
+            }
+
+            if (marker == null || marker.root == null)
+                continue;
+
+            // Room coordinates are authoritative after ROOM_ORIGIN calibration.
+            // Detach from an old detector anchor so the two pose sources cannot
+            // apply offsets on top of one another.
+            marker.root.transform.SetParent(transform, true);
+            marker.root.transform.SetPositionAndRotation(worldPosition, worldRotation);
+            marker.savedPosition = worldPosition;
+            marker.lastPlacementImagePoint = record.GetQrImageCenter();
+            marker.lastImageWidth = record.qrImageWidth;
+            marker.lastImageHeight = record.qrImageHeight;
+            marker.lastPlacementMethod = "RoomCoordinateFallback";
+            marker.anchorState = "room coordinate restored";
+            marker.anchor = null;
+            marker.isFollowingPlacementOrigin = false;
+            marker.isPlaced = true;
+
+            float restoredRadiationValue = record.lastRadiationValue >= 0f
+                ? record.lastRadiationValue
+                : marker.lastRadiationValue;
+            UpdateMarkerVisual(
+                marker,
+                GetLatestRadiationValue(detectorId, restoredRadiationValue));
+            if (newlyRestored)
+                restoredCount++;
+        }
+
+        if (restoredCount > 0)
+        {
+            Debug.Log(
+                $"[DetectorWorldMarkerManager] Restored {restoredCount} detector(s) " +
+                $"from room coordinates for {roomFrame.RoomId}.");
+        }
+
+        return restoredCount;
+    }
+
+    /// <summary>
+    /// Drops only session-world visuals after an XR tracking reset. Persistent room
+    /// coordinates and LIFO placement order remain intact and are materialized again
+    /// after ROOM_ORIGIN is calibrated in the new session frame.
+    /// </summary>
+    public void InvalidateRoomLocalization(string reason)
+    {
+        RollbackActivePlacementSession();
+
+        foreach (var pair in markers)
+        {
+            MarkerInfo marker = pair.Value;
+            if (marker == null)
+                continue;
+
+            SetMarkerRequestedVisibility(marker, false);
+            DestroyMarkerVisualResources(marker);
+            if (marker.root != null)
+                Destroy(marker.root);
+        }
+
+        markers.Clear();
+        currentFollowingDetectorId = "";
+        activePlacementSession = null;
+        lastInteractedDetectorId = "";
+
+        hasReceivedRadiationSnapshot = false;
+        lastSnapshotFreshnessState = false;
+        lastRadiationSnapshotTime = float.NegativeInfinity;
+        liveRadiationDetectorIds.Clear();
+
+        if (radiationSourceEstimator != null)
+        {
+            radiationSourceEstimator.SetCoordinateFrame(null);
+            radiationSourceEstimator.ClearEstimate();
+        }
+
+        Debug.LogWarning(
+            $"[DetectorWorldMarkerManager] Room localization invalidated; " +
+            $"runtime detector visuals were cleared. {reason}");
     }
 
     public void ClearSavedMarkers()
@@ -2249,12 +2990,16 @@ public class DetectorWorldMarkerManager : MonoBehaviour
         }
 
         markers.Clear();
+        placedDetectorOrder.Clear();
         currentFollowingDetectorId = "";
         activePlacementSession = null;
         lastInteractedDetectorId = "";
 
         if (coordinateDatabase != null)
             coordinateDatabase.ClearAllCoordinates();
+
+        if (radiationSourceEstimator != null)
+            radiationSourceEstimator.ClearEstimate();
     }
 
     public void PrintSavedCoordinatesToLog()
@@ -2307,6 +3052,12 @@ public class DetectorWorldMarkerManager : MonoBehaviour
                 color = color
             });
         }
+    }
+
+    private void OnValidate()
+    {
+        maximumRadiationSnapshotAgeSeconds =
+            Mathf.Max(0.5f, maximumRadiationSnapshotAgeSeconds);
     }
 
     public struct DetectorHudMarkerState

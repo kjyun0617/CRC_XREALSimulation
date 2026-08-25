@@ -971,7 +971,7 @@ MonoBehaviour:
   m_OnCullStateChanged:
     m_PersistentCalls:
       m_Calls: []
-  m_text: Enter text...
+  m_text: Server IP
   m_isRightToLeft: 0
   m_fontAsset: {fileID: 11400000, guid: 8f586378b4e144a9851e7b34d9b748ee, type: 2}
   m_sharedMaterial: {fileID: 2180264, guid: 8f586378b4e144a9851e7b34d9b748ee, type: 2}
@@ -1731,19 +1731,33 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   markerManager: {fileID: 0}
+  roomCoordinateSystem: {fileID: 0}
   qrScanner: {fileID: 0}
   radiationReceiver: {fileID: 0}
+  radiationSourceEstimator: {fileID: 0}
   captureManager: {fileID: 0}
   controllerIpInputField: {fileID: 1839976843988595143}
   controllerStatusText: {fileID: 5842819965593612338}
   controllerRadiationDisplayText: {fileID: 3786738891008175891}
   controllerCaptureStatusText: {fileID: 1329603708941523924}
   controllerRecordButtonText: {fileID: 6844470832479713164}
+  controllerQrScanButton: {fileID: 628936437795697096}
+  controllerPlaceButton: {fileID: 937238553181990968}
+  controllerCancelButton: {fileID: 2787899266830767384}
+  controllerQrScanButtonText: {fileID: 6373101375107967218}
+  controllerPlaceButtonText: {fileID: 6764980517116279943}
+  controllerCancelButtonText: {fileID: 4536082580287406978}
   detectorListMinFontSize: 10
   detectorListMaxFontSize: 40
   detectorListHorizontalPadding: 20
   detectorListHeight: 320
   detectorListCenterYOffset: 330
+  workflowGuideMinFontSize: 14
+  workflowGuideMaxFontSize: 34
+  workflowGuideHeight: 320
+  workflowGuideCenterYOffset: 330
+  workflowButtonMinFontSize: 10
+  workflowButtonMaxFontSize: 20
   autoFindReferences: 1
   logActions: 1
 --- !u!1 &6051116423564637513
@@ -2275,7 +2289,7 @@ MonoBehaviour:
   m_OnCullStateChanged:
     m_PersistentCalls:
       m_Calls: []
-  m_text: QR scan
+  m_text: Scan Room QR
   m_isRightToLeft: 0
   m_fontAsset: {fileID: 11400000, guid: 8f586378b4e144a9851e7b34d9b748ee, type: 2}
   m_sharedMaterial: {fileID: 2180264, guid: 8f586378b4e144a9851e7b34d9b748ee, type: 2}
